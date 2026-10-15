@@ -1,0 +1,34 @@
+#include <windows.h>
+
+// Version resource: this is what Windows shows under
+// right-click > Properties > Details on the DLL.
+
+1 VERSIONINFO
+FILEVERSION     1,0,7,0
+PRODUCTVERSION  1,0,7,0
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+FILEFLAGS       0
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_DLL
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName",      "Mhacks79"
+            VALUE "FileDescription",  "Freerun LE - parkour for Skyrim Legendary Edition"
+            VALUE "FileVersion",      "1.0.7.0"
+            VALUE "InternalName",     "FreerunLE"
+            VALUE "LegalCopyright",   "Mhacks79 - AGPL-3.0 - based on SkyParkour NG by Tsptds"
+            VALUE "OriginalFilename", "FreerunLE.dll"
+            VALUE "ProductName",      "Freerun LE"
+            VALUE "ProductVersion",   "1.0.7.0"
+            VALUE "Comments",         "SKSE plugin for Skyrim Legendary Edition 1.9.32.0.8"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
