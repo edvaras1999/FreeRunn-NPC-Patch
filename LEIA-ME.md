@@ -1,15 +1,19 @@
-# FreeRun LE + parkour em NPC (passo 2a, versão npc4)
+# FreeRun LE + parkour em NPC (passo 2b, versão npc5)
 
 Versão **de teste**, não para publicar. É o FreeRun LE 1.0.7 com um módulo novo para NPCs. Tudo o que acontece fica escrito no log (`Documentos\My Games\Skyrim\SKSE\FreerunLE.log`).
 
 > Aviso: não consegui compilar nem correr o jogo. A sintaxe do módulo novo foi verificada com os cabeçalhos do projeto (a parte de exceções do Windows só pelo compilador real). Se a compilação falhar, manda-me as linhas de erro do `build.log`.
 
 ## O que faz
-- **F10, teste manual (como no passo 1):** o NPC que estás a olhar tenta o movimento de parkour que lhe calhar à frente. Aparece uma mensagem com o resultado.
-- **F11, seguimento (novo):** o NPC que estás a olhar passa a ser "seguido". O estado dele vai para o log uma vez por segundo. Carrega F11 outra vez a olhar para ele para deixar de o seguir.
-- **Modo automático (novo, ligado por defeito):** um NPC seguido que fica **parado**, **longe de ti**, **mais ou menos virado para ti** e com um **obstáculo à frente** que o FreeRun aceitaria, faz o movimento sozinho. Depois há uma pausa antes de poder repetir. Não aparece nenhuma caixa de mensagem nos movimentos automáticos.
+- **F10, teste manual (como no passo 1):** o NPC que estás a olhar tenta o movimento de parkour que lhe calhar à frente.
+- **F11, seguimento:** o NPC que estás a olhar passa a ser "seguido". O estado dele vai para o log uma vez por segundo. Carrega F11 outra vez a olhar para ele para deixar de o seguir.
+- **Modo automático (ligado por defeito), mudou nesta versão.** O primeiro log mostrou que a seguidora não fica parada junto ao obstáculo: o pathing manda-a dar a volta, e ela corre, a afastar-se de ti, durante vários segundos. Agora o plugin deteta duas situações:
+  - **DETOUR:** ela corre (velocidade de animação ≥ 0,5) e **não se aproximou** de ti nos últimos 3 s.
+  - **PUSHING:** ela está a correr no mesmo sítio (parada, com a velocidade de animação alta).
 
-Só **um NPC de cada vez** é seguido. Depois de carregar um save, volta a carregar F11 a olhar para ela (o jogo não guarda quem estava a ser seguido).
+  Enquanto uma delas se verifica, duas vezes por segundo o plugin faz duas procuras de obstáculo: uma para onde ela está virada e outra **em linha reta para ti**. Se houver um obstáculo escalável logo ali (com o ponto de arranque a menos de 90 unidades dela) e subir não a afastar da tua altura, ela vira-se para ti e faz o movimento. Depois há uma pausa de 6 s.
+
+Só **um NPC de cada vez** é seguido. Depois de carregar um save, volta a carregar F11 a olhar para ela.
 
 ## 1. Compilar
 1. Cria um repositório novo no GitHub (ou atualiza o do passo 1).
@@ -25,10 +29,13 @@ Precisas do FreeRun LE instalado normalmente (Nemesis já executado com os patch
 3. Se já tens a secção `[Npc]` no `Freerun.ini`, podes deixá-la como está. As opções novas são opcionais (ver abaixo).
 
 ## 3. Testar
+Os movimentos automáticos não mostram caixas de mensagem: o que aconteceu vê-se no log.
+
+
 1. Carrega o save e anda um pouco **sem carregar em nada**, para confirmar que não há crash nem ícone a piscar.
 2. Olha para a seguidora e carrega **F11**. Deve aparecer a mensagem "tracking this NPC".
-3. Afasta-te dela de forma a que ela fique **presa num obstáculo** (muro baixo, caixote, vedação) entre vocês os dois, a mais de uns 250 de distância. Espera uns 2 segundos.
-4. Se tudo estiver certo, ela tenta o movimento sozinha. Se não, o log diz porquê: procura as linhas `NPC track`.
+3. Põe um obstáculo escalável (muro baixo, caixote, vedação) **entre vocês os dois**, com o caminho "normal" a obrigá-la a dar a volta, e afasta-te. Deixa-a a correr por ele.
+4. Se ela subir, ótimo. Se não, o log diz porquê: procura as linhas `NPC track`. Linhas com **DETOUR** ou **PUSHING** mostram quando o plugin achou que ela estava em apuros, e as linhas `a ledge ...` dizem o que a procura encontrou e porque foi (ou não) aceite.
 5. O F10 continua a funcionar como antes para testes manuais.
 
 Para só **registar** sem ela se mexer sozinha, põe `bAutoTracked=0`.
@@ -47,10 +54,13 @@ bAlignToPlayer=1
 fMaxDistance=800      ; alcance da pontaria
 bMessages=1           ; 0 desliga as caixas de mensagem (o log continua)
 bAutoTracked=1        ; 0 = só registar, nunca mexer sozinha
-fAutoMinDistance=250  ; só atua se estiver pelo menos a esta distância de ti
+fAutoMinDistance=200  ; só atua se estiver pelo menos a esta distância de ti
 fAutoMaxDistance=1500 ; ... e no máximo a esta
-fAutoStuckSec=2.0     ; tempo parada antes de atuar
+fAutoDetourSec=3.0    ; janela para medir se ela se aproximou (1 a 3,5)
+fAutoMinApproach=30   ; aproximar-se menos do que isto na janela = desvio
+fAutoStuckSec=2.0     ; PUSHING: tempo parada com a animação a correr
 fAutoMaxMove=40       ; mexer menos do que isto conta como estar parada
+fAutoMaxStartGap=90   ; o ponto de arranque do movimento tem de estar a esta distância dela, no máximo
 fAutoCooldownSec=6.0  ; pausa entre dois movimentos automáticos
 ```
 Se mandares a seguidora **esperar** num sítio, ela fica parada: carrega F11 a olhar para ela para deixar de a seguir, senão pode trepar o que estiver à frente dela.

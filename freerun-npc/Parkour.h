@@ -121,6 +121,10 @@ namespace Parkour
 	// heading, and works out the mark its animation starts from. Nothing of the
 	// player's state is changed: the working values are borrowed and handed
 	// back. Returns false when no usable ledge was found.
+	//
+	// `facing`, when given, replaces the actor's own facing for the search: a
+	// flat unit vector, so that the search can look toward a place the actor is
+	// not turned to. The actor itself is not turned.
 	bool ProbeForActor(Actor * npc, Type & outType, NiPoint3 & outLedge,
-					   NiPoint3 & outStart, float & outScale);
+					   NiPoint3 & outStart, float & outScale, const NiPoint3 * facing = NULL);
 }

@@ -57,7 +57,7 @@
 #include <shlobj.h>
 
 #define PLUGIN_NAME				"FreerunLE"
-#define PLUGIN_VERSION_STRING	"1.0.7-npc4"
+#define PLUGIN_VERSION_STRING	"1.0.7-npc5"
 #define PLUGIN_LOG_FILE			"\\My Games\\Skyrim\\SKSE\\FreerunLE.log"
 
 static PluginHandle			g_pluginHandle	= kPluginHandle_Invalid;

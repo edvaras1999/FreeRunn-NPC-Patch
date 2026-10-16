@@ -28,6 +28,8 @@ namespace
 	bool			s_menuOpen		= false;
 	bool			s_activating	= false;		// re-entrancy guard
 	bool			s_npcProbe		= false;		// NPC test build: a probe for an NPC is running
+	bool			s_probeFacingOn	= false;		// NPC test build: search in `s_probeFacing`, not where the actor faces
+	NiPoint3		s_probeFacing;
 
 	// ---- small maths -------------------------------------------------------
 
@@ -327,6 +329,8 @@ namespace
 		return ParkourPossible(player);
 	}
 
+	NiPoint3 ProbeFacing(Actor * actor);		// NPC test build: defined below, before FindLedge
+
 	// Climbing while running at a wall reads as a stumble rather than a climb,
 	// so a fast approach is only allowed when something is actually in the way
 	// at face height.
@@ -337,7 +341,7 @@ namespace
 		if(IsSwimming(player))			return true;
 
 		const NiPoint3 start = Add(Engine::Position(player), NiPoint3(0.0f, 0.0f, 120.0f * s_playerScale));
-		const Havok::Result face = Havok::RayCast(start, FacingFlat(player), 150.0f, kProbeLayer, player);
+		const Havok::Result face = Havok::RayCast(start, ProbeFacing(player), 150.0f, kProbeLayer, player);
 		if(face.didHit) return true;
 
 		return RelativeSpeed(player) <= 0.2f;
@@ -662,10 +666,17 @@ namespace
 		return kVault;
 	}
 
+	// NPC TEST BUILD: where a search looks - the actor's facing, unless a probe
+	// asked for a direction of its own.
+	NiPoint3 ProbeFacing(Actor * actor)
+	{
+		return s_probeFacingOn ? s_probeFacing : FacingFlat(actor);
+	}
+
 	Type FindLedge(Actor * player)
 	{
 		s_playerScale = ActorScale(player);
-		const NiPoint3 facing = FacingFlat(player);
+		const NiPoint3 facing = ProbeFacing(player);
 		if(facing.x == 0.0f && facing.y == 0.0f) return kNoLedge;
 
 		NiPoint3 ledgePoint;
@@ -720,7 +731,7 @@ namespace
 				return false;
 		}
 
-		const NiPoint3 back = Scale(FacingFlat(player), backOffset * s_playerScale);
+		const NiPoint3 back = Scale(ProbeFacing(player), backOffset * s_playerScale);
 		out.x = s_ledgePoint.x - back.x;
 		out.y = s_ledgePoint.y - back.y;
 		out.z = (type == kFailed) ? Engine::Position(player).z
@@ -1060,7 +1071,7 @@ namespace Parkour
 	// ---- NPC test build ----------------------------------------------------
 
 	bool ProbeForActor(Actor * npc, Type & outType, NiPoint3 & outLedge,
-					   NiPoint3 & outStart, float & outScale)
+					   NiPoint3 & outStart, float & outScale, const NiPoint3 * facing)
 	{
 		outType		= kNoLedge;
 		outLedge	= NiPoint3(0.0f, 0.0f, 0.0f);
@@ -1074,8 +1085,13 @@ namespace Parkour
 		const float		savedScale	= s_playerScale;
 
 		s_npcProbe = true;
+		if(facing)
+		{
+			s_probeFacing	= *facing;
+			s_probeFacingOn	= true;
+		}
+
 		const Type type = FindLedge(npc);
-		s_npcProbe = false;
 
 		bool ok = false;
 		if(type != kNoLedge)
@@ -1083,6 +1099,9 @@ namespace Parkour
 			outLedge = s_ledgePoint;
 			ok = StartingPosition(npc, type, outStart);
 		}
+
+		s_probeFacingOn	= false;
+		s_npcProbe		= false;
 
 		outType		= type;
 		outScale	= s_playerScale;
