@@ -350,7 +350,7 @@ namespace Havok
 		transform[13] = start.y * scale;
 		transform[14] = start.z * scale;
 
-		Collidable collidable;
+		__declspec(align(16)) Collidable collidable;
 		memset(&collidable, 0, sizeof(collidable));
 		collidable.shape				= shape;
 		collidable.shapeKey				= 0xFFFFFFFF;
@@ -361,7 +361,11 @@ namespace Havok
 		collidable.collisionFilterInfo	= CastFilter(caster, layer);
 		collidable.allowedPenetrationDepth = 0.0f;
 
-		LinearCastInput input;
+		// NPC TEST BUILD: this has to be 16-byte aligned. The engine reads `to`
+		// with an aligned SSE load (movaps), and a plain local only happens to be
+		// aligned when the compiler's frame layout is lucky. Without this, the
+		// cast crashes the moment the layout shifts.
+		__declspec(align(16)) LinearCastInput input;
 		input.to[0] = result.hitPosition.x * scale;
 		input.to[1] = result.hitPosition.y * scale;
 		input.to[2] = result.hitPosition.z * scale;
@@ -369,7 +373,7 @@ namespace Havok
 		input.maxExtraPenetration	= 0.01f;
 		input.startPointTolerance	= 0.01f;
 
-		PointCollector collector;
+		__declspec(align(16)) PointCollector collector;
 		collector.Init();
 
 		typedef void * (__thiscall * _GetWorld1)(void *);

@@ -1,7 +1,9 @@
-# FreeRun LE + teste de parkour em NPC (passo 1)
+# FreeRun LE + teste de parkour em NPC (passo 1, versão npc2)
 
 Versão **de teste**, não para publicar. É o FreeRun LE 1.0.7 com um módulo novo: ao carregar **F10**, o NPC que estás a olhar tenta um movimento de parkour. Serve para responder a uma só pergunta: **o patch do FreeRun funciona num NPC?** Tudo o que acontece fica escrito no log.
 
+> Versão npc2: corrige um crash ao carregar o save (variável do Havok sem alinhamento a 16 bytes; ver o Havok.cpp).
+>
 > Aviso: não consegui compilar nem correr o jogo. A sintaxe do módulo novo foi verificada com os cabeçalhos do projeto, mas o SKSE real ou o jogo podem mostrar erros. Se a compilação falhar, manda-me as linhas de erro do `build.log`.
 
 ## 1. Compilar
