@@ -6,3 +6,5 @@
 Esta compilação mantém a licença **AGPL-3.0** (ver `LICENSE`). As alterações ao código do FreeRun LE estão marcadas com `NPC TEST BUILD`, e o módulo novo está em `NpcParkour.h` e `NpcParkour.cpp`.
 
 Não inclui nem redistribui o patch do Nemesis nem as animações: é preciso ter o FreeRun LE instalado.
+
+`Havok.h` e `Havok.cpp` vêm do projeto FreeClimb LE (FreeClimbe-Beta), com ajustes mínimos marcados `NPC TEST BUILD`.

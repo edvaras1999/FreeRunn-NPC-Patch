@@ -88,18 +88,17 @@ namespace
 
 	// Doors are the classic false positive: their frame reads as a perfect
 	// ledge. Actors are excluded for the obvious reason.
-	bool ExcludedClimbForm(TESObjectREFR * ref)
+	// NPC TEST BUILD: these take the form TYPE, a value the Havok layer checked
+	// while it held the physics world, instead of a pointer to the reference.
+	// Havok::kFormType_Unknown matches nothing, so nothing is excluded.
+	bool ExcludedClimbForm(UInt8 formType)
 	{
-		if(!ref || !ref->baseForm) return false;
-		const UInt8 type = ref->baseForm->formType;
-		return type == kFormType_NPC;
+		return formType == kFormType_NPC;
 	}
 
-	bool ExcludedVaultForm(TESObjectREFR * ref)
+	bool ExcludedVaultForm(UInt8 formType)
 	{
-		if(!ref || !ref->baseForm) return false;
-		const UInt8 type = ref->baseForm->formType;
-		return type == kFormType_NPC || type == kFormType_Activator;
+		return formType == kFormType_NPC || formType == kFormType_Activator;
 	}
 
 	// ---- scale -------------------------------------------------------------
@@ -508,15 +507,17 @@ namespace
 			float distance = down.distance;
 			NiPoint3 normal = down.normal;
 			UInt32 layer = down.layer;
-			TESObjectREFR * ref = down.ref;
+			UInt8 formType = down.formType;
 			for(UInt32 h = 0; h < down.hitCount; ++h)
 			{
 				if(ExcludedClimbLayer(down.hits[h].layer)) continue;
-				if(!down.hits[h].ref) continue;
+				// (A hit with no reference behind it - terrain - used to be skipped here,
+				// but the old lookup never actually returned null, so terrain was always
+				// climbable. That is kept: nothing is skipped for lacking a reference.)
 				distance	= down.hits[h].distance;
 				normal		= down.hits[h].normal;
 				layer		= down.hits[h].layer;
-				ref			= down.hits[h].ref;
+				formType	= down.hits[h].formType;
 				break;
 			}
 			if(!down.didHit) continue;
@@ -547,7 +548,7 @@ namespace
 				if(obs2.didHit || obs1.distance < needed) continue;
 			}
 
-			if(ExcludedClimbForm(ref)) return kNoLedge;			// a door frame is not a ledge
+			if(ExcludedClimbForm(formType)) return kNoLedge;			// a door frame is not a ledge
 
 			// Headroom above the ledge for the body that is about to stand up.
 			const float headRoomRadius = 15.0f;
@@ -615,7 +616,7 @@ namespace
 			down = Havok::ShapeCast(downStart, kDown, playerHeight, 5.0f, kProbeLayer, player);
 			if(!down.didHit) continue;
 			if(ExcludedVaultLayer(down.layer)) continue;
-			if(ExcludedVaultForm(down.ref)) continue;
+			if(ExcludedVaultForm(down.formType)) continue;
 
 			const float height = (headPos.z - down.distance) - playerPos.z;
 			if(height > maxHeight) return kNoLedge;			// too tall to vault: let the climb decide

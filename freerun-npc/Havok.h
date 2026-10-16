@@ -34,6 +34,12 @@ namespace Havok
 	// never hide something closer.
 	enum { kMaxHits = 32 };
 
+	// What `formType` says when the hit could not be traced back to a form -
+	// terrain, a collision object with no reference behind it, anything the
+	// lookup refused. It excludes nothing, which is what a null reference used
+	// to mean to the callers.
+	enum { kFormType_Unknown = 0xFF };
+
 	struct Hit
 	{
 		float			fraction;		// 0..1 along the cast
@@ -41,7 +47,21 @@ namespace Havok
 		NiPoint3		position;
 		NiPoint3		normal;
 		UInt32			layer;
-		TESObjectREFR *	ref;			// may be null: static geometry has no reference
+
+		// Whether a real reference owns what was hit: terrain and loose
+		// collision have none, and neither does anything the lookup refused.
+		//
+		// This is a value, not a pointer, on purpose. The reference was found and
+		// checked while the cast still held the physics world, which is the only
+		// moment it is known to be alive, and nothing that points into the world
+		// is allowed out of that window.
+		bool			hasReference;
+		UInt8			formType;		// its base form's type, or kFormType_Unknown
+
+		// NPC TEST BUILD: the reference itself, already checked, for the NPC test
+		// and nothing else. It is only good for the tick that made the cast: use
+		// it at once and never keep it. Null whenever hasReference is false.
+		TESObjectREFR *	ref;
 	};
 
 	struct Result
@@ -53,12 +73,23 @@ namespace Havok
 		NiPoint3		hitPosition;
 		NiPoint3		normal;
 		UInt32			layer;
-		TESObjectREFR *	ref;
+		bool			hasReference;
+		UInt8			formType;
+		TESObjectREFR *	ref;			// NPC TEST BUILD: see Hit::ref
 
 		UInt32			hitCount;
 		Hit				hits[kMaxHits];	// sorted, nearest first
 
-		Result() { memset(this, 0, sizeof(Result)); }
+		// Only the header is cleared, not the hit array.
+		//
+		// A tick of the ledge search makes dozens of casts, and each one used to
+		// zero 1.1 kB of hits that nothing ever read: the fill writes every
+		// field of a hit as it adds it, and every reader stops at hitCount.
+		Result()
+		{
+			memset(this, 0, (size_t)((const UInt8 *)&hits[0] - (const UInt8 *)this));
+			formType = kFormType_Unknown;
+		}
 	};
 
 	// Collision layers, as the engine numbers them. Only the ones this plugin

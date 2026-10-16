@@ -4,6 +4,7 @@
 #include "skse/GameReferences.h"
 #include "skse/GameRTTI.h"
 
+#include <windows.h>
 #include <float.h>
 
 namespace
@@ -53,9 +54,186 @@ namespace
 											void * castCollector, void * startCollector);
 	const _LinearCast LinearCast = (_LinearCast)0x00D4F190;
 
-	// TESHavokUtilities::FindCollidableRef
-	typedef TESObjectREFR * (__cdecl * _FindCollidableRef)(const void * collidable);
-	const _FindCollidableRef FindCollidableRef = (_FindCollidableRef)0x004726B0;
+	// Finding out what a cast hit, in the two steps the engine itself takes.
+	//
+	// THIS IS WHAT CRASHED 1.0.7, so it is worth writing down in full.
+	//
+	// Special Edition asks TESHavokUtilities::FindCollidableRef for the
+	// reference behind a collidable and gets one back. The function at
+	// 0x004726B0 was taken for that one. It is not: it is the OTHER half of the
+	// pair, FindCollidableObject, and what it returns is the scene object - in
+	// its main path literally bhkNiCollisionObject::sceneObject, the pointer at
+	// +0x08 of the collision object (read at 0x00D13C50, which 0x004726B0 tail
+	// calls). An NiAVObject, not a reference.
+	//
+	// Reading ->baseForm at +0x24 of that scene object lands inside
+	// NiAVObject::localTransform - on the second entry of the rotation matrix.
+	// For anything standing square to the world that entry is 0.0, the null
+	// check passes and nothing happens, which is why this ran at all. For
+	// anything ROTATED it is a sine: a float, read as a pointer, and
+	// dereferenced one byte later for the form type. The address 0xBF7D8C99 in
+	// the crash report is 0xBF7D8C87 + 0x12, and 0xBF7D8C87 as a float is
+	// -0.99042553 - a rotation matrix entry, exactly as predicted. Whether that
+	// bogus address happens to be mapped depends on how much memory the load
+	// order has committed, which is why it took some machines and not others.
+	//
+	// The engine never does this. Its own ray cast (0x006BF93C) calls 0x004726B0
+	// and passes the result straight to 0x004D7C90 before using it as a
+	// reference; 14 of the 20 call sites in the executable do the same. That
+	// second function walks up the scene graph by parent (+0x18) until it finds
+	// a node carrying a reference, reads the reference's baseForm at +0x24 and
+	// its formType at +0x12 - the very offsets this plugin wants - and skips
+	// furniture markers (type 0x2A) in favour of whatever owns them. It also
+	// answers the player's own first person 3D with the player.
+	//
+	// Both are __cdecl with one stack argument (0x004726B0: mov ecx,[esp+4] then
+	// ret; 0x004D7C90: mov esi,[esp+0xc] after two pushes, and its own recursive
+	// call cleans the stack with add esp,4).
+	typedef void * (__cdecl * _FindCollidableObject)(const void * collidable);
+	const _FindCollidableObject FindCollidableObject = (_FindCollidableObject)0x004726B0;
+
+	typedef TESObjectREFR * (__cdecl * _ReferenceFor3D)(const void * sceneObject);
+	const _ReferenceFor3D ReferenceFor3D = (_ReferenceFor3D)0x004D7C90;
+
+	// Where the executable is and how far it goes, so a pointer that should be
+	// an engine object can be checked for carrying an engine vtable.
+	UInt32 s_imageEnd = 0;	// namespace scope: a function-local static has a guarded initialiser (F4)
+
+	UInt32 ImageEnd()
+	{
+		UInt32 & s_end = s_imageEnd;
+		if(!s_end)
+		{
+			const UInt8 * base = (const UInt8 *)0x00400000;
+			const UInt32 peOffset = *(const UInt32 *)(base + 0x3C);
+			s_end = 0x00400000 + *(const UInt32 *)(base + peOffset + 0x18 + 0x38);	// SizeOfImage
+		}
+		return s_end;
+	}
+
+	// Could this be a pointer at all?
+	bool LooksLikePointer(const void * object)
+	{
+		const UInt32 address = (UInt32)object;
+		if(address < 0x00010000)	return false;	// the null page
+		if(address & 3)				return false;	// no engine object is misaligned
+		if(address >= 0xFFFF0000)	return false;	// reserved top of the address space (see Engine::Readable)
+		return true;
+	}
+
+	// Does this look like an object the game made?
+	//
+	// Every reference and every form in the game carries a vtable that lives in
+	// the executable itself. A rotation matrix entry read as a pointer does not,
+	// which is what tells the two apart - and where such a value points at
+	// nothing at all, reading the vtable faults and the guard below catches it.
+	// Four compares against a crash.
+	//
+	// Only applied to what is actually dereferenced here, the reference and its
+	// base form. The scene object in between is handed to the engine's own
+	// lookup rather than read, and a scene graph can hold node types that belong
+	// to another plugin - body physics does exactly that - whose vtables are in
+	// that plugin, not in the game.
+	bool LooksLikeEngineObject(const void * object)
+	{
+		if(!LooksLikePointer(object)) return false;
+		const UInt32 vtable = *(const UInt32 *)object;
+		return vtable >= 0x00400000 && vtable < ImageEnd();
+	}
+
+	// The whole lookup, in one place. It must only be called while the world's
+	// read lock is held - the callers below see to that - because the collidable,
+	// the scene object and the reference are only known to be alive while nothing
+	// can take the physics world apart.
+	//
+	// Nothing leaves here but values: whether there is a reference at all, and the
+	// type of its base form. Both are written last, after every check has passed,
+	// so a half-validated answer cannot get out.
+	//
+	// No C++ object with a destructor may live in here: the compiler will not
+	// mix structured exception handling with unwinding. The guard is the last
+	// line of defence, not the plan - the plan is the two-step lookup above.
+	void ResolveRef(const void * collidable, bool & outHasReference, UInt8 & outFormType, TESObjectREFR *& outRef)
+	{
+		outHasReference	= false;
+		outFormType		= Havok::kFormType_Unknown;
+		outRef			= NULL;		// NPC TEST BUILD
+
+		if(!collidable) return;
+
+		__try
+		{
+			void * object = FindCollidableObject(collidable);
+			if(!LooksLikePointer(object)) return;
+
+			TESObjectREFR * ref = ReferenceFor3D(object);
+			if(!LooksLikeEngineObject(ref)) return;
+
+			// A vtable inside the executable only says the game made it. Every
+			// reference class - references, actors, projectiles, hazards - sits
+			// in one run of form types, and a culling process or a node does not.
+			if(ref->formType < kFormType_Reference || ref->formType > kFormType_PHZD) return;
+
+			TESForm * base = ref->baseForm;
+			if(!LooksLikeEngineObject(base)) return;
+
+			const UInt8 type = base->formType;
+
+			outFormType		= type;
+			outRef			= ref;		// NPC TEST BUILD
+			outHasReference	= true;
+		}
+		__except(EXCEPTION_EXECUTE_HANDLER)
+		{
+			outHasReference	= false;
+			outFormType		= Havok::kFormType_Unknown;
+			outRef			= NULL;		// NPC TEST BUILD
+		}
+	}
+
+	// ------------------------------------------------------------- world lock
+	//
+	// What the port was missing, and the one thing the Special Edition original
+	// does on every single cast:
+	//
+	//     RE::BSReadLockGuard lock(bhkWorld->worldLock);
+	//
+	// around both its ray pick and its linear cast. The mod ticks from the
+	// player's animation graph, which is not necessarily the thread the physics
+	// world is being stepped on, and a cast walking a broad phase that is being
+	// rebuilt under it reads whatever is half-written - a different outcome on
+	// every machine, which is the shape of the reports.
+	//
+	// The engine's own bhkWorld::PickObject (0x00D104A0) takes exactly this
+	// lock: 0x00432A40 constructs an eight byte guard { hkpWorld *, mode } over
+	// the world, and 0x004319E0 releases it. Mode 0 is the read side
+	// (0x00D0E2C0 -> 0x00A4AEE0, which bumps a reader count) and the whole
+	// mechanism is a no-op while the flag at 0x012D19A0 is clear, so this costs
+	// nothing on a game that is not running physics across threads.
+	//
+	// Nesting is safe, and the original nests it the same way: the writer side
+	// (0x00A4AF50) only ever swaps a lock word of exactly zero and otherwise
+	// spins, so it cannot hold a second read lock off while waiting for the
+	// first, and a reader that already owns the lock just counts up.
+	struct WorldLock
+	{
+		void *	hkWorld;
+		int		mode;
+
+		void Acquire(void * bhkWorld)
+		{
+			hkWorld	= NULL;
+			mode	= 0;
+			typedef void * (__thiscall * _Acquire)(WorldLock *, void *, int);
+			((_Acquire)0x00432A40)(this, bhkWorld, 0 /* read */);
+		}
+
+		void Release()
+		{
+			typedef void (__fastcall * _Release)(WorldLock *);
+			((_Release)0x004319E0)(this);
+		}
+	};
 
 	// The Havok allocator the hit arrays grow from. The object lives at this
 	// address and its free is vtable slot 4, thiscall(this, memory, bytes) -
@@ -71,10 +249,41 @@ namespace
 	}
 
 	// ---------------------------------------------------------------- types
+	//
+	// EVERY STRUCTURE BELOW IS ALIGNED TO SIXTEEN, AND THAT IS NOT DECORATION.
+	//
+	// This is what crashed the mod on loading a save and on starting a new game,
+	// for a year's worth of versions, and it is the one difference between this
+	// edition and Special Edition that cannot be read off a disassembly listing:
+	// 64-bit code is handed a 16-byte aligned stack by the calling convention, so
+	// the original never had to think about any of this. In 32-bit code a stack
+	// local is aligned to four bytes and no more.
+	//
+	// Havok's vectors are SSE registers, and the engine moves them with MOVAPS,
+	// which FAULTS OUTRIGHT on an address that is not a multiple of sixteen. The
+	// instruction that killed it was
+	//
+	//     00DE014E   movaps xmm0, [edi]          ; edi = the cast input
+	//
+	// reached from hkpWorld::linearCast, called from ShapeCast below, called from
+	// the animation graph tick. The crash log says the faulting address is
+	// 0xFFFFFFFF, which is not an address at all: that is what Windows reports
+	// for a misaligned SSE access, and it is the signature to recognise.
+	//
+	// Why it took some people and not others, and why it came and went between
+	// versions: the address of a stack local is the stack pointer at that point
+	// plus an offset the compiler chose, so whether it lands on a multiple of
+	// sixteen depends on how deep the call was and on how much the rest of the
+	// function happened to put on the stack. Change anything above it - another
+	// local, a different thread doing the tick - and the alignment moves. The mod
+	// was not working on some machines; it was getting away with it.
+	//
+	// So nothing handed to Havok is left to chance here, whether this edition's
+	// engine is seen to use MOVAPS on it or not.
 
 	// hkpAllRayHitTempCollector: the constructor above lays it out, each hit is
 	// 0x60 bytes with the fraction at +0x10 and the collidable at +0x50.
-	struct RayCollector
+	__declspec(align(16)) struct RayCollector
 	{
 		UInt8	raw[0x320];
 
@@ -86,7 +295,7 @@ namespace
 	// hkpAllCdPointCollector. Built by hand rather than with the engine's
 	// constructor at 0x005851B0, because that one also builds a phantom and a
 	// shape for the engine's own sphere caster.
-	struct PointCollector
+	__declspec(align(16)) struct PointCollector
 	{
 		// What the engine's own constructor writes: an early-out distance no
 		// contact can beat, and room for sixteen contacts before the array
@@ -133,7 +342,7 @@ namespace
 	// hkpCollidable. The offsets are the ones FindCollidableRef reads:
 	// ownerOffset at +0x10, the broad phase type at +0x18 and the collision
 	// filter at +0x1C.
-	struct Collidable
+	__declspec(align(16)) struct Collidable
 	{
 		const void *	shape;			// 0x00
 		UInt32			shapeKey;		// 0x04
@@ -152,7 +361,7 @@ namespace
 		float			allowedPenetrationDepth;
 	};
 
-	struct LinearCastInput
+	__declspec(align(16)) struct LinearCastInput
 	{
 		float	to[4];					// 0x00
 		float	maxExtraPenetration;	// 0x10
@@ -190,6 +399,77 @@ namespace
 		return CellBhkWorld(cell);
 	}
 
+	// ------------------------------------------------------- shapes, once each
+	//
+	// Every sphere cast used to take a block off the game's heap, run the
+	// bhkCapsuleShape constructor (which builds an hkpCapsuleShape behind it),
+	// cast once, and hand both back through the deleting destructor. The Special
+	// Edition original does the same - but a tick of the ledge search makes
+	// twenty to forty sphere casts, so that is up to forty allocations and forty
+	// shape constructions per frame, all of them for one of four radii, all of
+	// them identical to the last frame's.
+	//
+	// A cast does not modify the shape it sweeps, and a shape that belongs to no
+	// world has nothing to keep it in step with anything, so the four are built
+	// once and kept. That is four small allocations for the life of the process
+	// against forty per frame, and it takes the game's heap - which other
+	// plugins replace, and which locks - out of the per-frame path entirely.
+	enum { kShapeCacheSize = 8 };
+
+	struct CachedShape
+	{
+		float	radius;
+		void *	wrapper;	// bhkCapsuleShape
+		void *	shape;		// the hkpCapsuleShape behind it
+	};
+
+	CachedShape s_shapes[kShapeCacheSize];
+	UInt32		s_shapeCount = 0;
+
+	// The hkpCapsuleShape for a sphere of this radius, built the first time it is
+	// asked for.
+	//
+	// outWrapper comes back non-null only when the cache had no room, and then it
+	// is the caller's to release after the cast - so a plugin that one day casts
+	// with more than eight different radii gets slower, not leakier. Every radius
+	// in this plugin is a constant, and there are three of them.
+	void * SphereShape(float radius, void *& outWrapper)
+	{
+		outWrapper = NULL;
+
+		for(UInt32 i = 0; i < s_shapeCount; ++i)
+			if(s_shapes[i].radius == radius)
+				return s_shapes[i].shape;
+
+		void * wrapper = Engine::HeapAllocate(0x14, 0, false);
+		if(!wrapper) return NULL;
+
+		const NiPoint3 zero(0.0f, 0.0f, 0.0f);
+		CapsuleShapeCtor(wrapper, &zero, &zero, radius);
+
+		void * shape = *(void **)((UInt8 *)wrapper + 0x08);	// bhkRefObject::referencedObject
+		if(!shape)
+		{
+			Engine::HeapFree(wrapper, false);
+			return NULL;
+		}
+
+		if(s_shapeCount < kShapeCacheSize)
+		{
+			CachedShape & slot = s_shapes[s_shapeCount];
+			slot.radius		= radius;
+			slot.wrapper	= wrapper;
+			slot.shape		= shape;
+			++s_shapeCount;
+		}
+		else
+		{
+			outWrapper = wrapper;
+		}
+
+		return shape;
+	}
+
 	void SortHits(Havok::Result & result)
 	{
 		for(UInt32 i = 1; i < result.hitCount; ++i)
@@ -202,6 +482,135 @@ namespace
 				--j;
 			}
 			result.hits[j + 1] = key;
+		}
+	}
+
+	// The two casts, each inside the lock, each giving it back whatever happens -
+	// and each reading EVERYTHING it needs out of what the cast returned before
+	// it lets go.
+	//
+	// The collector holds pointers to collidables, and a collidable belongs to the
+	// physics world. The read lock is what keeps the world from being taken apart,
+	// so the moment it is released those pointers are only addresses. Reading the
+	// layer and following a collidable to its reference after the release - which
+	// is what the first versions here did, while the comments said otherwise - is
+	// a use of memory that may have been freed and handed to something else, and
+	// a stale pointer that now points at a live object of another type is the one
+	// kind of mistake no null check can see.
+	//
+	// A fault anywhere under the cast would otherwise walk straight past the
+	// release and leave the world read-locked for good - and the next thread to
+	// want the write side spins on it forever. A crash is bad; a game that hangs
+	// with no message at all is worse, and it is the one failure this mod must
+	// never cause. __finally runs on the way out either way.
+	//
+	// Nothing in the locked functions sorts, classifies or logs: copy and leave.
+	// No C++ object with a destructor may live in these two functions.
+	void ReadRayHits(Havok::Result & result, const RayCollector & collector,
+					 const NiPoint3 & start, const NiPoint3 & dir, float distance)
+	{
+		const UInt32 count = collector.Size();
+		for(UInt32 i = 0; i < count; ++i)
+		{
+			const UInt8 * entry = collector.At(i);
+			const float fraction = *(const float *)(entry + 0x10);
+			const void * collidable = *(const void **)(entry + 0x50);
+			if(!collidable) continue;
+
+			Havok::Hit * slot = SlotFor(result, fraction);
+			if(!slot) continue;
+
+			Havok::Hit & hit = *slot;
+			hit.fraction	= fraction;
+			hit.distance	= distance * fraction;
+			hit.position	= NiPoint3(start.x + dir.x * hit.distance, start.y + dir.y * hit.distance, start.z + dir.z * hit.distance);
+			const float * n = (const float *)(entry + 0x00);
+			hit.normal		= NiPoint3(n[0], n[1], n[2]);
+			hit.layer		= *(const UInt32 *)((const UInt8 *)collidable + 0x1C) & 0x7F;
+			ResolveRef(collidable, hit.hasReference, hit.formType, hit.ref);
+		}
+	}
+
+	void ReadPickRoot(Havok::Result & result, const UInt8 * pickData)
+	{
+		const void * root = *(const void **)(pickData + 0x80);
+		if(!root) return;
+
+		result.layer = *(const UInt32 *)((const UInt8 *)root + 0x1C) & 0x7F;
+		ResolveRef(root, result.hasReference, result.formType, result.ref);
+	}
+
+	bool LockedPickAndRead(void * world, UInt8 * pickData, const RayCollector & collector,
+						   Havok::Result & result, const NiPoint3 & start, const NiPoint3 & dir,
+						   float distance)
+	{
+		bool picked = false;
+
+		WorldLock lock;
+		lock.Acquire(world);
+		__try
+		{
+			typedef bool (__thiscall * _PickObject)(void *, void *);
+			picked = (*(_PickObject **)world)[kBhkWorld_PickObject](world, pickData) &&
+					 *(float *)(pickData + 0x40) < 1.0f;
+
+			ReadRayHits(result, collector, start, dir, distance);
+			if(picked) ReadPickRoot(result, pickData);
+		}
+		__finally
+		{
+			lock.Release();
+		}
+
+		return picked;
+	}
+
+	void ReadShapeHits(Havok::Result & result, const PointCollector & collector, float distance)
+	{
+		const UInt32 count = collector.size;
+		for(UInt32 i = 0; i < count; ++i)
+		{
+			const UInt8 * entry = collector.At(i);
+			const float * position	= (const float *)(entry + 0x00);
+			const float * normal	= (const float *)(entry + 0x10);
+			// The fourth component of the separating normal is how far along
+			// the cast the contact happened.
+			const float fraction	= normal[3];
+			const void * collidableB = *(const void **)(entry + 0x28);
+			if(!collidableB) continue;
+
+			// A swept shape against a piece of architecture produces a contact
+			// per face it touches, so this one overflows even more readily than
+			// the ray does.
+			Havok::Hit * slot = SlotFor(result, fraction);
+			if(!slot) continue;
+
+			Havok::Hit & hit = *slot;
+			hit.fraction	= fraction;
+			hit.distance	= distance * fraction;
+			hit.position	= NiPoint3(position[0] * Engine::HavokScaleInverse(),
+									   position[1] * Engine::HavokScaleInverse(),
+									   position[2] * Engine::HavokScaleInverse());
+			hit.normal		= NiPoint3(normal[0], normal[1], normal[2]);
+			hit.layer		= *(const UInt32 *)((const UInt8 *)collidableB + 0x1C) & 0x7F;
+			ResolveRef(collidableB, hit.hasReference, hit.formType, hit.ref);
+		}
+	}
+
+	void LockedLinearCastAndRead(void * world, void * hkWorld, const void * collidable,
+								 const void * input, PointCollector & collector,
+								 Havok::Result & result, float distance)
+	{
+		WorldLock lock;
+		lock.Acquire(world);
+		__try
+		{
+			LinearCast(hkWorld, collidable, input, &collector, NULL);
+			ReadShapeHits(result, collector, distance);
+		}
+		__finally
+		{
+			lock.Release();
 		}
 	}
 }
@@ -227,7 +636,7 @@ namespace Havok
 		__declspec(align(16)) UInt8 pickData[0xC0];
 		memset(pickData, 0, sizeof(pickData));
 
-		RayCollector collector;
+		__declspec(align(16)) RayCollector collector;
 		RayCollectorCtor(&collector);
 
 		float * from = (float *)(pickData + 0x00);
@@ -252,30 +661,7 @@ namespace Havok
 		*(void  **)(pickData + 0xAC) = &collector;					// all hits, not just the nearest
 		*(UInt8  *)(pickData + 0xB0) = 0;
 
-		typedef bool (__thiscall * _PickObject)(void *, void *);
-		const bool picked = (*(_PickObject **)world)[kBhkWorld_PickObject](world, pickData) &&
-							*(float *)(pickData + 0x40) < 1.0f;
-
-		const UInt32 count = collector.Size();
-		for(UInt32 i = 0; i < count; ++i)
-		{
-			const UInt8 * entry = collector.At(i);
-			const float fraction = *(const float *)(entry + 0x10);
-			const void * collidable = *(const void **)(entry + 0x50);
-			if(!collidable) continue;
-
-			Havok::Hit * slot = SlotFor(result, fraction);
-			if(!slot) continue;
-
-			Hit & hit = *slot;
-			hit.fraction	= fraction;
-			hit.distance	= distance * fraction;
-			hit.position	= NiPoint3(start.x + dir.x * hit.distance, start.y + dir.y * hit.distance, start.z + dir.z * hit.distance);
-			const float * n = (const float *)(entry + 0x00);
-			hit.normal		= NiPoint3(n[0], n[1], n[2]);
-			hit.layer		= *(const UInt32 *)((const UInt8 *)collidable + 0x1C) & 0x7F;
-			hit.ref			= FindCollidableRef(collidable);
-		}
+		const bool picked = LockedPickAndRead(world, pickData, collector, result, start, dir, distance);
 
 		SortHits(result);
 
@@ -288,12 +674,7 @@ namespace Havok
 										   start.z + dir.z * result.distance);
 			const float * n = (const float *)(pickData + 0x30);
 			result.normal		= NiPoint3(n[0], n[1], n[2]);
-			const void * root = *(const void **)(pickData + 0x80);
-			if(root)
-			{
-				result.layer	= *(const UInt32 *)((const UInt8 *)root + 0x1C) & 0x7F;
-				result.ref		= FindCollidableRef(root);
-			}
+			// layer, reference and form type of the root were read under the lock
 		}
 		else if(result.hitCount)
 		{
@@ -304,7 +685,9 @@ namespace Havok
 			result.hitPosition	= result.hits[0].position;
 			result.normal		= result.hits[0].normal;
 			result.layer		= result.hits[0].layer;
-			result.ref			= result.hits[0].ref;
+			result.hasReference	= result.hits[0].hasReference;
+			result.formType		= result.hits[0].formType;
+			result.ref			= result.hits[0].ref;		// NPC TEST BUILD
 		}
 
 		(void)inv;
@@ -327,18 +710,11 @@ namespace Havok
 
 		// A capsule whose two vertices sit on top of each other is a sphere,
 		// which is what every cast in this plugin wants: no orientation to get
-		// wrong as the cast direction changes.
-		const NiPoint3 zero(0.0f, 0.0f, 0.0f);
-		void * shapeWrapper = Engine::HeapAllocate(0x14, 0, false);
-		if(!shapeWrapper) return result;
-		CapsuleShapeCtor(shapeWrapper, &zero, &zero, radius);
-
-		void * shape = *(void **)((UInt8 *)shapeWrapper + 0x08);	// bhkRefObject::referencedObject
-		if(!shape)
-		{
-			Engine::HeapFree(shapeWrapper, false);
-			return result;
-		}
+		// wrong as the cast direction changes. Built once per radius and kept -
+		// see SphereShape above.
+		void * shapeWrapper = NULL;
+		void * shape = SphereShape(radius, shapeWrapper);
+		if(!shape) return result;
 
 		const float scale = Engine::HavokScale();
 
@@ -361,10 +737,6 @@ namespace Havok
 		collidable.collisionFilterInfo	= CastFilter(caster, layer);
 		collidable.allowedPenetrationDepth = 0.0f;
 
-		// NPC TEST BUILD: this has to be 16-byte aligned. The engine reads `to`
-		// with an aligned SSE load (movaps), and a plain local only happens to be
-		// aligned when the compiler's frame layout is lucky. Without this, the
-		// cast crashes the moment the layout shifts.
 		__declspec(align(16)) LinearCastInput input;
 		input.to[0] = result.hitPosition.x * scale;
 		input.to[1] = result.hitPosition.y * scale;
@@ -379,36 +751,7 @@ namespace Havok
 		typedef void * (__thiscall * _GetWorld1)(void *);
 		void * hkWorld = (*(_GetWorld1 **)world)[kBhkWorld_GetWorld1](world);
 		if(hkWorld)
-			LinearCast(hkWorld, &collidable, &input, &collector, NULL);
-
-		const UInt32 count = collector.size;
-		for(UInt32 i = 0; i < count; ++i)
-		{
-			const UInt8 * entry = collector.At(i);
-			const float * position	= (const float *)(entry + 0x00);
-			const float * normal	= (const float *)(entry + 0x10);
-			// The fourth component of the separating normal is how far along
-			// the cast the contact happened.
-			const float fraction	= normal[3];
-			const void * collidableB = *(const void **)(entry + 0x28);
-			if(!collidableB) continue;
-
-			// A swept shape against a piece of architecture produces a contact
-			// per face it touches, so this one overflows even more readily than
-			// the ray does.
-			Havok::Hit * slot = SlotFor(result, fraction);
-			if(!slot) continue;
-
-			Hit & hit = *slot;
-			hit.fraction	= fraction;
-			hit.distance	= distance * fraction;
-			hit.position	= NiPoint3(position[0] * Engine::HavokScaleInverse(),
-									   position[1] * Engine::HavokScaleInverse(),
-									   position[2] * Engine::HavokScaleInverse());
-			hit.normal		= NiPoint3(normal[0], normal[1], normal[2]);
-			hit.layer		= *(const UInt32 *)((const UInt8 *)collidableB + 0x1C) & 0x7F;
-			hit.ref			= FindCollidableRef(collidableB);
-		}
+			LockedLinearCastAndRead(world, hkWorld, &collidable, &input, collector, result, distance);
 
 		SortHits(result);
 
@@ -419,16 +762,22 @@ namespace Havok
 			result.hitPosition	= result.hits[0].position;
 			result.normal		= result.hits[0].normal;
 			result.layer		= result.hits[0].layer;
-			result.ref			= result.hits[0].ref;
+			result.hasReference	= result.hits[0].hasReference;
+			result.formType		= result.hits[0].formType;
+			result.ref			= result.hits[0].ref;		// NPC TEST BUILD
 		}
 
 		collector.Release();
 
-		// The shape was made for this one cast: hand it straight back. The
-		// wrapper's deleting destructor releases the hkpCapsuleShape behind it
-		// and frees the wrapper from the same heap it came from.
-		typedef void (__thiscall * _DeleteThis)(void *, UInt8);
-		(*(_DeleteThis **)shapeWrapper)[0](shapeWrapper, 1);
+		// Only ever set when the shape cache was full, which this plugin's three
+		// radii cannot do: the wrapper's deleting destructor releases the
+		// hkpCapsuleShape behind it and frees the wrapper from the heap it came
+		// from.
+		if(shapeWrapper)
+		{
+			typedef void (__thiscall * _DeleteThis)(void *, UInt8);
+			(*(_DeleteThis **)shapeWrapper)[0](shapeWrapper, 1);
+		}
 
 		return result;
 	}

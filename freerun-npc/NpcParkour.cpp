@@ -282,14 +282,16 @@ namespace
 
         for(UInt32 h = 0; h < r.hitCount; ++h)
         {
-            TESObjectREFR * ref = r.hits[h].ref;
-            _MESSAGE("NPC test:   hit %u: layer %u, %.0f units, reference %08X, base type %u",
-                     (unsigned int)h, (unsigned int)r.hits[h].layer, r.hits[h].distance,
-                     (unsigned int)(ref ? ref->formID : 0),
-                     (unsigned int)((ref && ref->baseForm) ? ref->baseForm->formType : 0));
+            const Havok::Hit & hit = r.hits[h];
+            TESObjectREFR * ref = hit.hasReference ? hit.ref : NULL;
+
+            _MESSAGE("NPC test:   hit %u: layer %u, %.0f units, has reference %d, form type %u, reference %08X",
+                     (unsigned int)h, (unsigned int)hit.layer, hit.distance,
+                     hit.hasReference ? 1 : 0, (unsigned int)hit.formType,
+                     (unsigned int)(ref ? ref->formID : 0));
 
             if(!ref || ref == (TESObjectREFR *)player) continue;
-            if(!ref->baseForm || ref->baseForm->formType != kFormType_NPC) continue;
+            if(hit.formType != kFormType_NPC) continue;
 
             return (Actor *)ref;
         }
