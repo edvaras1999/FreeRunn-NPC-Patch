@@ -284,6 +284,10 @@ namespace
 				if(isDown && NpcParkour::Enabled() && KeyCodeOf(button) == NpcParkour::TestKey())
 					NpcParkour::RequestTest();
 
+				// --- NPC TEST BUILD: the key that starts or stops tracking the NPC in front ---
+				if(isDown && NpcParkour::Enabled() && KeyCodeOf(button) == NpcParkour::TrackKey())
+					NpcParkour::RequestTrack();
+
 				// --- the sneak key, for the slide and the roll ---
 				if(strings && control && (*control == strings->sneak))
 					Slide::OnSneakPressed(player, isDown, isHeld, button->timer);

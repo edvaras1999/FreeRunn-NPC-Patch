@@ -1,46 +1,59 @@
-# FreeRun LE + teste de parkour em NPC (passo 1, versão npc3)
+# FreeRun LE + parkour em NPC (passo 2a, versão npc4)
 
-Versão **de teste**, não para publicar. É o FreeRun LE 1.0.7 com um módulo novo: ao carregar **F10**, o NPC que estás a olhar tenta um movimento de parkour. Serve para responder a uma só pergunta: **o patch do FreeRun funciona num NPC?** Tudo o que acontece fica escrito no log.
+Versão **de teste**, não para publicar. É o FreeRun LE 1.0.7 com um módulo novo para NPCs. Tudo o que acontece fica escrito no log (`Documentos\My Games\Skyrim\SKSE\FreerunLE.log`).
 
-> Versão npc3: troca a camada Havok (`Havok.h` e `Havok.cpp`) pela versão corrigida do teu projeto FreeClimb LE. Isso resolve os dois crashes que apareceram com o código de 2 de outubro do FreeRun: variáveis do Havok sem alinhamento a 16 bytes, e um ponteiro errado ao identificar o objeto atingido pelo raio (a função em `0x004726B0` devolve o objeto de cena, não a referência). Além disso, o raio passa a ser feito com o bloqueio de leitura do mundo físico.
->
-> Aviso: não consegui compilar nem correr o jogo. A sintaxe do módulo novo foi verificada com os cabeçalhos do projeto, mas o SKSE real ou o jogo podem mostrar erros. Se a compilação falhar, manda-me as linhas de erro do `build.log`.
+> Aviso: não consegui compilar nem correr o jogo. A sintaxe do módulo novo foi verificada com os cabeçalhos do projeto (a parte de exceções do Windows só pelo compilador real). Se a compilação falhar, manda-me as linhas de erro do `build.log`.
+
+## O que faz
+- **F10, teste manual (como no passo 1):** o NPC que estás a olhar tenta o movimento de parkour que lhe calhar à frente. Aparece uma mensagem com o resultado.
+- **F11, seguimento (novo):** o NPC que estás a olhar passa a ser "seguido". O estado dele vai para o log uma vez por segundo. Carrega F11 outra vez a olhar para ele para deixar de o seguir.
+- **Modo automático (novo, ligado por defeito):** um NPC seguido que fica **parado**, **longe de ti**, **mais ou menos virado para ti** e com um **obstáculo à frente** que o FreeRun aceitaria, faz o movimento sozinho. Depois há uma pausa antes de poder repetir. Não aparece nenhuma caixa de mensagem nos movimentos automáticos.
+
+Só **um NPC de cada vez** é seguido. Depois de carregar um save, volta a carregar F11 a olhar para ela (o jogo não guarda quem estava a ser seguido).
 
 ## 1. Compilar
-1. Cria um repositório novo no GitHub (por exemplo `FreeRunNPC-LE`).
+1. Cria um repositório novo no GitHub (ou atualiza o do passo 1).
 2. Descompacta este ZIP e envia **tudo**: as pastas `.github` e `freerun-npc` e os ficheiros `LICENSE`, `LEIA-ME.md` e `NOTICE.md`.
 3. Separador **Actions** → "Build FreeRun LE + teste NPC (passo 1)" → **Run workflow**.
 4. No fim, descarrega o artefacto `resultado`: tem o `FreerunLE.dll` e o `build.log`.
 
 ## 2. Instalar
-Precisas do FreeRun LE instalado normalmente, com o Nemesis já executado com "SkyParkour 1st Person" e "SkyParkour 3rd Person".
+Precisas do FreeRun LE instalado normalmente (Nemesis já executado com os patches 1st e 3rd Person).
 
 1. Faz uma cópia de `Data\SKSE\Plugins\FreerunLE.dll`.
-2. Substitui-o pelo novo (o nome é igual de propósito, para nunca ficarem os dois).
-3. Arranca o jogo. O log `Documentos\My Games\Skyrim\SKSE\FreerunLE.log` deve conter `Freerun LE 1.0.7-npc1` e `NPC test: on, key 68`.
+2. Substitui-o pelo novo. O log deve dizer `Freerun LE 1.0.7-npc4`.
+3. Se já tens a secção `[Npc]` no `Freerun.ini`, podes deixá-la como está. As opções novas são opcionais (ver abaixo).
 
 ## 3. Testar
-Primeiro **sem carregar F10**: carrega o save, anda, corre e salta durante uns minutos. Não deve haver crash nem ícone a piscar. Só depois faz o teste do NPC:
+1. Carrega o save e anda um pouco **sem carregar em nada**, para confirmar que não há crash nem ícone a piscar.
+2. Olha para a seguidora e carrega **F11**. Deve aparecer a mensagem "tracking this NPC".
+3. Afasta-te dela de forma a que ela fique **presa num obstáculo** (muro baixo, caixote, vedação) entre vocês os dois, a mais de uns 250 de distância. Espera uns 2 segundos.
+4. Se tudo estiver certo, ela tenta o movimento sozinha. Se não, o log diz porquê: procura as linhas `NPC track`.
+5. O F10 continua a funcionar como antes para testes manuais.
 
-1. Escolhe um NPC (um seguidor serve) e um obstáculo: caixote, muro baixo ou vedação.
-2. Põe o NPC **encostado ao obstáculo** (a menos de uns 70 unidades, cerca de 1 m) e fica **atrás dele**, virado para o NPC e para o obstáculo.
-3. Carrega **F10**. Aparece uma mensagem com o resultado.
-4. Repete com obstáculos de alturas diferentes.
+Para só **registar** sem ela se mexer sozinha, põe `bAutoTracked=0`.
 
 ## 4. O que me mandar
-- O ficheiro `FreerunLE.log`, logo a seguir ao teste.
-- O que viste: não fez nada / animou mas ficou preso / subiu / caiu a ragdoll / o jogo fechou.
+- O `FreerunLE.log`, logo a seguir ao teste.
+- O que viste: não fez nada / fez o movimento certo / fez sem estar presa / ficou presa / caiu a ragdoll / o jogo fechou.
 
 ## 5. Opções (secção `[Npc]` em `Data\SKSE\Plugins\Freerun.ini`)
 ```
 [Npc]
 bEnabled=1
-iTestKey=68
+iTestKey=68           ; F10, teste manual
+iTrackKey=87          ; F11, seguir / deixar de seguir
 bAlignToPlayer=1
-fMaxDistance=800
-bMessages=1
+fMaxDistance=800      ; alcance da pontaria
+bMessages=1           ; 0 desliga as caixas de mensagem (o log continua)
+bAutoTracked=1        ; 0 = só registar, nunca mexer sozinha
+fAutoMinDistance=250  ; só atua se estiver pelo menos a esta distância de ti
+fAutoMaxDistance=1500 ; ... e no máximo a esta
+fAutoStuckSec=2.0     ; tempo parada antes de atuar
+fAutoMaxMove=40       ; mexer menos do que isto conta como estar parada
+fAutoCooldownSec=6.0  ; pausa entre dois movimentos automáticos
 ```
-`iTestKey=68` é a tecla F10 (código DirectInput). `bAlignToPlayer=1` vira o NPC para a direção do teu corpo antes de procurar a borda. `bMessages=0` desliga as caixas de mensagem (o log continua).
+Se mandares a seguidora **esperar** num sítio, ela fica parada: carrega F11 a olhar para ela para deixar de a seguir, senão pode trepar o que estiver à frente dela.
 
 ## 6. Voltar atrás
 Repõe a cópia do `FreerunLE.dll` original.

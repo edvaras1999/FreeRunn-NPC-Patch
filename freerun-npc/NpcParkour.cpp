@@ -51,6 +51,15 @@ namespace
     float   s_maxDistance   = 800.0f;
     bool    s_messages      = true;
 
+    // Step 2: the tracked NPC (see TrackTick).
+    UInt32  s_trackKey          = 87;       // DirectInput scan code of F11
+    bool    s_autoTracked       = true;     // false: only log, never act on its own
+    float   s_autoMinDistance   = 250.0f;   // game units from the player, at least
+    float   s_autoMaxDistance   = 1500.0f;  // ... and at most
+    float   s_autoStuckSec      = 2.0f;     // how long it must have stood still
+    float   s_autoMaxMove       = 40.0f;    // moving less than this counts as standing still
+    float   s_autoCooldownSec   = 6.0f;     // pause between two automatic moves
+
     // ---- timing (milliseconds of real time) ---------------------------------
 
     const DWORD kRequestTtlMs    = 1000;    // a key press goes stale after this
@@ -72,6 +81,23 @@ namespace
     DWORD           s_lastTrace     = 0;
     Parkour::Type   s_type          = Parkour::kNoLedge;
     NiPoint3        s_start;                // where the animation expects to begin
+
+    // The tracked NPC. The pointer is never trusted: every use goes through
+    // TrackedAlive, and the whole per-sample evaluation sits inside a guard.
+    Actor *         s_tracked           = NULL;
+    UInt32          s_trackedId         = 0;
+    bool            s_trackRequested    = false;
+    DWORD           s_trackRequestedAt  = 0;
+    bool            s_manual            = true;     // the running move came from the key
+    NiPoint3        s_anchor;                       // where it last was when it was moving
+    DWORD           s_anchorTime        = 0;
+    bool            s_anchorReset       = true;
+    DWORD           s_lastSample        = 0;
+    DWORD           s_lastProbe         = 0;
+    DWORD           s_lastTrackTrace    = 0;
+    DWORD           s_cooldownUntil     = 0;
+    Parkour::Type   s_lastProbeType     = Parkour::kNoLedge;
+    bool            s_haveProbe         = false;
     NiPoint3        s_posBefore;
 
     // The position correction: the same idea as the player's, with its own state
@@ -95,6 +121,15 @@ namespace
     }
 
     // ---- small helpers ------------------------------------------------------
+
+    float ReadFloat(const char * key, float fallback)
+    {
+        char defaultText[32];
+        sprintf_s(defaultText, sizeof(defaultText), "%f", fallback);
+        char buffer[64];
+        GetPrivateProfileStringA("Npc", key, defaultText, buffer, sizeof(buffer), ".\\Data\\SKSE\\Plugins\\Freerun.ini");
+        return (float)atof(buffer);
+    }
 
     const char * TypeName(Parkour::Type type)
     {
@@ -134,6 +169,20 @@ namespace
         if(!Engine::CharController(npc)) return false;
         if(!Engine::Get3D(npc, false)) return false;
         return true;
+    }
+
+    // The same question, with the access violation caught: for an NPC whose
+    // pointer has been kept across frames.
+    bool SafeUsable(Actor * npc)
+    {
+        __try
+        {
+            return NpcUsable(npc);
+        }
+        __except(EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
     }
 
     // Everything ParkourPossible asks of the player that makes sense for an NPC.
@@ -243,6 +292,14 @@ namespace
         if(touchNpc && s_npc)
             ReleaseNpc(s_npc, sendInterrupt);
 
+        // A move the plugin started on its own is followed by a pause, so one
+        // stuck NPC cannot be set off again and again.
+        if(!s_manual)
+        {
+            s_cooldownUntil = GetTickCount() + (DWORD)(s_autoCooldownSec * 1000.0f);
+            s_anchorReset   = true;
+        }
+
         s_state     = kIdle;
         s_npc       = NULL;
         s_requested = false;
@@ -259,7 +316,7 @@ namespace
         sprintf_s(text, sizeof(text),
                   "FreeRun NPC test: it did not work.\n\n%s\n\n"
                   "The log has the details:\nDocuments\\My Games\\Skyrim\\SKSE\\FreerunLE.log", why);
-        ShowText(text);
+        if(s_manual) ShowText(text);
     }
 
     // ---- 1. aim -------------------------------------------------------------
@@ -311,6 +368,7 @@ namespace
             return;
         }
 
+        s_manual = true;
         _MESSAGE("NPC test: key pressed");
 
         Actor * npc = FindTarget(player);
@@ -432,14 +490,14 @@ namespace
                   "FreeRun NPC test: finished.\n\nMove: %s\nTime: %lu ms\nHeight change: %.0f units\n\n"
                   "If it did not look right, send FreerunLE.log.",
                   TypeName(type), (unsigned long)took, rise);
-        ShowText(text);
+        if(s_manual) ShowText(text);
     }
 
     void Step()
     {
         Actor * npc = s_npc;
 
-        if(!NpcUsable(npc))
+        if(!SafeUsable(npc))
         {
             _ERROR("NPC test: the NPC is gone, dead or no longer loaded: stopping without touching it");
             EndTest(false, false);
@@ -517,6 +575,197 @@ namespace
                 return;
         }
     }
+
+    // ---- step 2: the tracked NPC --------------------------------------------
+    //
+    // One NPC is watched - the follower the player pointed at with the track
+    // key. There is no list of the actors around to pick from, and a ray cast
+    // around the player would miss anything not squarely in its path, so the
+    // NPC is chosen once, by aiming, and followed from then on.
+    //
+    // Ten times a second its position is compared with where it last was
+    // while moving. "Stuck" is: standing still, far from the player, roughly
+    // facing the player, with a ledge in front of it that the player's own
+    // search would accept. Everything that is measured is written to the log
+    // once a second, whether or not anything is done about it.
+
+    bool TrackedAlive(Actor * npc, UInt32 id)
+    {
+        __try
+        {
+            if(!npc) return false;
+            if(npc->formID != id) return false;
+            if(npc->formType != kFormType_Character) return false;
+            return true;
+        }
+        __except(EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+    }
+
+    void StopTracking(const char * why)
+    {
+        if(s_tracked)
+            _MESSAGE("NPC track: stopped tracking %08X (%s)", (unsigned int)s_trackedId, why);
+        s_tracked   = NULL;
+        s_trackedId = 0;
+    }
+
+    // Starts a move on the tracked NPC without the alignment wait: it is
+    // already facing what it is stuck on.
+    void StartOn(Actor * npc)
+    {
+        s_manual        = false;
+        s_npc           = npc;
+        s_state         = kAligning;
+        s_stateStart    = GetTickCount() - kAlignMs;      // probe on the very next tick
+    }
+
+    void HandleTrack(Actor * player)
+    {
+        if(Parkour::MenuOpen()) return;
+
+        Actor * npc = FindTarget(player);
+        if(!npc)
+        {
+            _MESSAGE("NPC track: no NPC found in front of the player");
+            ShowText("FreeRun NPC: no NPC found in front of you.\n\nStand facing the NPC you want to track.");
+            return;
+        }
+
+        if(npc == s_tracked)
+        {
+            StopTracking("asked to stop");
+            ShowText("FreeRun NPC: no longer tracking this NPC.");
+            return;
+        }
+
+        s_tracked       = npc;
+        s_trackedId     = npc->formID;
+        s_anchorReset   = true;
+        s_cooldownUntil = 0;
+        s_haveProbe     = false;
+
+        _MESSAGE("NPC track: now tracking %08X (automatic moves %s)",
+                 (unsigned int)s_trackedId, s_autoTracked ? "on" : "off, log only");
+
+        char text[256];
+        sprintf_s(text, sizeof(text),
+                  "FreeRun NPC: tracking this NPC.\n\n%s\n\nPress the same key facing it to stop.",
+                  s_autoTracked ? "When it is stuck far from you it will try to climb on its own."
+                                : "Log only: it will not move on its own.");
+        ShowText(text);
+    }
+
+    void TrackTick(Actor * player)
+    {
+        const DWORD now = GetTickCount();
+        if(now - s_lastSample < 100) return;
+        s_lastSample = now;
+
+        Actor * npc = s_tracked;
+        if(!TrackedAlive(npc, s_trackedId))
+        {
+            StopTracking("the actor is gone");
+            return;
+        }
+
+        if(!NpcUsable(npc))
+        {
+            s_anchorReset = true;               // not loaded right now: start over when it is
+            return;
+        }
+
+        const NiPoint3 pos          = Engine::Position(npc);
+        const NiPoint3 playerPos    = Engine::Position(player);
+
+        if(s_anchorReset)
+        {
+            s_anchor        = pos;
+            s_anchorTime    = now;
+            s_anchorReset   = false;
+        }
+
+        const float ax = pos.x - s_anchor.x;
+        const float ay = pos.y - s_anchor.y;
+        const float az = pos.z - s_anchor.z;
+        const float moved = sqrtf(ax * ax + ay * ay + az * az);
+        if(moved > s_autoMaxMove)
+        {
+            s_anchor        = pos;
+            s_anchorTime    = now;
+        }
+        const float stillFor = (float)(now - s_anchorTime) / 1000.0f;
+
+        const float tx = playerPos.x - pos.x;
+        const float ty = playerPos.y - pos.y;
+        const float distance = sqrtf(tx * tx + ty * ty);
+
+        const NiPoint3 facing = Parkour::FacingFlat(npc);
+        float dot = 0.0f;
+        if(distance > 1.0f) dot = (facing.x * tx + facing.y * ty) / distance;
+
+        const bool inRange  = distance >= s_autoMinDistance && distance <= s_autoMaxDistance;
+        const bool still    = stillFor >= s_autoStuckSec;
+        const bool facingOk = dot > 0.0f;
+
+        const char * why = NULL;
+        const bool canAct = NpcCanAct(npc, why);
+
+        // The ledge search is the expensive part, so it only runs when everything
+        // else already says "stuck", and at most twice a second.
+        bool probedNow = false;
+        if(inRange && still && facingOk && canAct && now - s_lastProbe >= 500)
+        {
+            Parkour::Type type = Parkour::kNoLedge;
+            NiPoint3 ledge(0.0f, 0.0f, 0.0f);
+            NiPoint3 start(0.0f, 0.0f, 0.0f);
+            float scale = 1.0f;
+            Parkour::ProbeForActor(npc, type, ledge, start, scale);
+
+            s_lastProbe     = now;
+            s_lastProbeType = type;
+            s_haveProbe     = true;
+            probedNow       = true;
+        }
+
+        if(now - s_lastTrackTrace >= 1000)
+        {
+            s_lastTrackTrace = now;
+            _MESSAGE("NPC track %08X: distance %.0f, still for %.1f s (moved %.0f), facing the player %.2f, "
+                     "relative speed %.2f, %s, last ledge probe: %s",
+                     (unsigned int)s_trackedId, distance, stillFor, moved, dot,
+                     Parkour::RelativeSpeed(npc),
+                     canAct ? "free to act" : (why ? why : "busy"),
+                     s_haveProbe ? TypeName(s_lastProbeType) : "none yet");
+        }
+
+        if(!s_autoTracked || !probedNow) return;
+        if(s_lastProbeType == Parkour::kNoLedge || s_lastProbeType == Parkour::kFailed) return;
+        if(now < s_cooldownUntil) return;
+        if(Parkour::InProgress() || Parkour::MenuOpen()) return;
+
+        _MESSAGE("NPC track %08X: stuck for %.1f s, %.0f units from the player, ledge ahead (%s): starting the move on its own",
+                 (unsigned int)s_trackedId, stillFor, distance, TypeName(s_lastProbeType));
+        StartOn(npc);
+    }
+
+    // The access violation caught, so that whatever is wrong with a pointer
+    // kept across frames costs the tracking and not the game.
+    void SafeTrackTick(Actor * player)
+    {
+        __try
+        {
+            TrackTick(player);
+        }
+        __except(EXCEPTION_EXECUTE_HANDLER)
+        {
+            _ERROR("NPC track: an exception while evaluating %08X: tracking stopped", (unsigned int)s_trackedId);
+            s_tracked   = NULL;
+            s_trackedId = 0;
+        }
+    }
 }
 
 namespace NpcParkour
@@ -534,6 +783,20 @@ namespace NpcParkour
         if(s_maxDistance < 100.0f)  s_maxDistance = 100.0f;
         if(s_maxDistance > 3000.0f) s_maxDistance = 3000.0f;
 
+        s_trackKey          = (UInt32)GetPrivateProfileIntA(kSection, "iTrackKey", (int)s_trackKey, kIni);
+        s_autoTracked       = GetPrivateProfileIntA(kSection, "bAutoTracked", s_autoTracked ? 1 : 0, kIni) != 0;
+        s_autoMinDistance   = ReadFloat("fAutoMinDistance", s_autoMinDistance);
+        s_autoMaxDistance   = ReadFloat("fAutoMaxDistance", s_autoMaxDistance);
+        s_autoStuckSec      = ReadFloat("fAutoStuckSec", s_autoStuckSec);
+        s_autoMaxMove       = ReadFloat("fAutoMaxMove", s_autoMaxMove);
+        s_autoCooldownSec   = ReadFloat("fAutoCooldownSec", s_autoCooldownSec);
+        if(s_autoStuckSec < 0.5f)       s_autoStuckSec = 0.5f;
+        if(s_autoCooldownSec < 1.0f)    s_autoCooldownSec = 1.0f;
+
+        _MESSAGE("NPC track: key %u, automatic moves %s, from %.0f to %.0f units away, still for %.1f s (moves under %.0f), pause %.1f s",
+                 (unsigned int)s_trackKey, s_autoTracked ? "on" : "off", s_autoMinDistance, s_autoMaxDistance,
+                 s_autoStuckSec, s_autoMaxMove, s_autoCooldownSec);
+
         _MESSAGE("NPC test: %s, key %u, align to player %d, aim distance %.0f, messages %d",
                  s_enabled ? "on" : "off", (unsigned int)s_testKey, s_alignToPlayer ? 1 : 0,
                  s_maxDistance, s_messages ? 1 : 0);
@@ -541,6 +804,7 @@ namespace NpcParkour
 
     bool    Enabled()   { return s_enabled; }
     UInt32  TestKey()   { return s_testKey; }
+    UInt32  TrackKey()  { return s_trackKey; }
 
     void RequestTest()
     {
@@ -551,18 +815,39 @@ namespace NpcParkour
         s_requestedAt   = GetTickCount();
     }
 
+    void RequestTrack()
+    {
+        if(!s_enabled) return;
+        if(s_state != kIdle) return;
+
+        s_trackRequested    = true;
+        s_trackRequestedAt  = GetTickCount();
+    }
+
     // Once per animation update of the player. The common case - nothing
-    // requested, nothing running - is two comparisons.
+    // requested, nothing running, nothing tracked - is a handful of comparisons.
     void OnTick(Actor * player)
     {
         if(s_state == kIdle)
         {
-            if(!s_requested) return;
-            s_requested = false;
+            if(s_requested)
+            {
+                s_requested = false;
+                if(GetTickCount() - s_requestedAt <= kRequestTtlMs)     // stale: a menu held the tick back
+                    Begin(player);
+                return;
+            }
 
-            if(GetTickCount() - s_requestedAt > kRequestTtlMs) return;     // stale: a menu held the tick back
+            if(s_trackRequested)
+            {
+                s_trackRequested = false;
+                if(GetTickCount() - s_trackRequestedAt <= kRequestTtlMs)
+                    HandleTrack(player);
+                return;
+            }
 
-            Begin(player);
+            if(s_tracked)
+                SafeTrackTick(player);
             return;
         }
 
@@ -579,6 +864,7 @@ namespace NpcParkour
         s_state     = kIdle;
         s_requested = false;
         s_npc       = NULL;
+        s_anchorReset = true;                   // the tracked NPC, if any, is kept
         ResetCorrection();
     }
 }
