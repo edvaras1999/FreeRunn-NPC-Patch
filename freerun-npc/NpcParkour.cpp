@@ -62,12 +62,15 @@ namespace
     float   s_autoDetourSec     = 3.0f;     // the window in which she must have come no closer
     float   s_autoMinApproach   = 30.0f;    // ... by less than this many units, to count as a detour
     float   s_autoMaxStartGap   = 90.0f;    // she must already be this close to the move's start mark
+    bool    s_manualToward      = true;     // F10: try the ledge between her and the player, from where she stands
+    float   s_manualMaxGap      = 150.0f;   // F10: how far from the start mark she may be
 
     // ---- timing (milliseconds of real time) ---------------------------------
 
     const DWORD kRequestTtlMs    = 1000;    // a key press goes stale after this
     const DWORD kAlignMs         = 400;     // wait after turning the NPC
     const DWORD kStartTimeoutMs  = 1500;    // the behaviour must react within this
+    const DWORD kPlanSettleMs    = 150;     // after turning her toward the player, before the move is sent
     const DWORD kActionTimeoutMs = 9000;    // hard stop for one move
     const DWORD kTraceEveryMs    = 250;
 
@@ -92,6 +95,9 @@ namespace
     bool            s_trackRequested    = false;
     DWORD           s_trackRequestedAt  = 0;
     bool            s_manual            = true;     // the running move came from the key
+    bool            s_planValid         = false;    // a ledge was found a moment ago and is not searched for again
+    Parkour::Type   s_planType          = Parkour::kNoLedge;
+    NiPoint3        s_planStart;
     NiPoint3        s_anchor;                       // where it last was when it was moving
     DWORD           s_anchorTime        = 0;
     bool            s_anchorReset       = true;
@@ -306,6 +312,7 @@ namespace
         s_state     = kIdle;
         s_npc       = NULL;
         s_requested = false;
+        s_planValid = false;
         ResetCorrection();
     }
 
@@ -377,6 +384,30 @@ namespace
 
     // ---- 2..4. align, probe, start ------------------------------------------
 
+    // Starts a move on an NPC whose ledge is already known. When `turn` is set she
+    // is turned to `yaw` (the way the engine reads it: clockwise from north).
+    // Her physics are switched off at once, so that she cannot run on while the
+    // turn settles; the first ticks of the move walk her to the start mark, and
+    // ReleaseNpc gives her physics back when it ends.
+    void StartOn(Actor * npc, bool turn, float yaw, bool manual, Parkour::Type type, const NiPoint3 & start)
+    {
+        s_manual    = manual;
+        s_npc       = npc;
+        s_state     = kAligning;
+        s_planValid = true;
+        s_planType  = type;
+        s_planStart = start;
+
+        void * ctrl = Engine::CharController(npc);
+        if(ctrl)
+            Engine::ControllerFlags(ctrl) |= Engine::Controller::kFlag_NoSim;
+
+        if(turn)
+            Engine::Rotation(npc).z = yaw;
+
+        s_stateStart = GetTickCount() - (kAlignMs - kPlanSettleMs);
+    }
+
     void Begin(Actor * player)
     {
         if(Parkour::MenuOpen()) return;
@@ -410,6 +441,60 @@ namespace
             return;
         }
 
+        if(s_manualToward)
+        {
+            // The same decision the automatic mode takes: the ledge between her
+            // and the player, from where she stands right now.
+            const NiPoint3 here   = Engine::Position(npc);
+            const NiPoint3 there  = Engine::Position(player);
+            const float tx = there.x - here.x;
+            const float ty = there.y - here.y;
+            const float distance = sqrtf(tx * tx + ty * ty);
+            if(distance < 1.0f)
+            {
+                Fail("The NPC is on top of you.", false);
+                return;
+            }
+
+            const NiPoint3 toward(tx / distance, ty / distance, 0.0f);
+            Parkour::Type type = Parkour::kNoLedge;
+            NiPoint3 ledge(0.0f, 0.0f, 0.0f), start(0.0f, 0.0f, 0.0f);
+            float scale = 1.0f;
+            const bool ok = Parkour::ProbeForActor(npc, type, ledge, start, scale, &toward);
+
+            _MESSAGE("NPC test: target %08X, %.0f units from you; toward you the ledge search says %s",
+                     (unsigned int)npc->formID, distance, TypeName(type));
+
+            if(!ok || type == Parkour::kNoLedge)
+            {
+                Fail("No ledge found between the NPC and you.\n\nShe has to be standing right at the foot of a climbable edge (a low wall, a rock, a crate), on the side facing you.", false);
+                return;
+            }
+
+            if(type == Parkour::kFailed)
+            {
+                Fail("The NPC does not have enough stamina for this move.", false);
+                return;
+            }
+
+            const float gx = start.x - here.x, gy = start.y - here.y, gz = start.z - here.z;
+            const float gap = sqrtf(gx * gx + gy * gy + gz * gz);
+            _MESSAGE("NPC test: %s, her start mark is %.0f away (limit %.0f)", TypeName(type), gap, s_manualMaxGap);
+
+            if(gap > s_manualMaxGap)
+            {
+                char text[256];
+                sprintf_s(text, sizeof(text),
+                          "The NPC is %.0f units from where the move would start (limit %.0f).\n\nMove her closer to the edge.",
+                          gap, s_manualMaxGap);
+                Fail(text, false);
+                return;
+            }
+
+            StartOn(npc, true, atan2f(tx, ty), true, type, start);
+            return;
+        }
+
         s_npc = npc;
         _MESSAGE("NPC test: target is %08X", (unsigned int)npc->formID);
 
@@ -434,34 +519,49 @@ namespace
         _MESSAGE("NPC test: NPC at (%.1f, %.1f, %.1f), heading %.3f, controller facing (%.2f, %.2f)",
                  pos.x, pos.y, pos.z, Engine::Rotation(npc).z, facing.x, facing.y);
 
-        if(facing.x == 0.0f && facing.y == 0.0f)
-        {
-            Fail("The NPC's character controller has no facing, so no ledge can be searched.", false);
-            return;
-        }
-
         Parkour::Type type = Parkour::kNoLedge;
         NiPoint3 ledge(0.0f, 0.0f, 0.0f);
         NiPoint3 start(0.0f, 0.0f, 0.0f);
-        float scale = 1.0f;
 
-        const bool ok = Parkour::ProbeForActor(npc, type, ledge, start, scale);
-        _MESSAGE("NPC test: ledge search says %s (%d), actor scale %.2f", TypeName(type), (int)type, scale);
-
-        if(!ok || type == Parkour::kNoLedge)
+        if(s_planValid)
         {
-            Fail("No ledge found in front of the NPC.\n\nIt has to stand within about 70 units of a climbable edge (a low wall, a crate, a fence), facing it.", false);
-            return;
+            // The ledge was found when the move was decided, and she has been
+            // held in place since. Searching again would look from wherever the
+            // AI has walked her to meanwhile - the first automatic tries failed
+            // exactly like that. The start mark is a point in the world: it does
+            // not move with her, and the first ticks walk her to it.
+            type    = s_planType;
+            start   = s_planStart;
+            _MESSAGE("NPC test: using the ledge found a moment ago (%s), start mark (%.1f, %.1f, %.1f)",
+                     TypeName(type), start.x, start.y, start.z);
         }
-
-        if(type == Parkour::kFailed)
+        else
         {
-            Fail("The NPC does not have enough stamina for this move.", false);
-            return;
-        }
+            if(facing.x == 0.0f && facing.y == 0.0f)
+            {
+                Fail("The NPC's character controller has no facing, so no ledge can be searched.", false);
+                return;
+            }
 
-        _MESSAGE("NPC test: ledge at (%.1f, %.1f, %.1f), start mark (%.1f, %.1f, %.1f)",
-                 ledge.x, ledge.y, ledge.z, start.x, start.y, start.z);
+            float scale = 1.0f;
+            const bool ok = Parkour::ProbeForActor(npc, type, ledge, start, scale);
+            _MESSAGE("NPC test: ledge search says %s (%d), actor scale %.2f", TypeName(type), (int)type, scale);
+
+            if(!ok || type == Parkour::kNoLedge)
+            {
+                Fail("No ledge found in front of the NPC.\n\nIt has to stand within about 70 units of a climbable edge (a low wall, a crate, a fence), facing it.", false);
+                return;
+            }
+
+            if(type == Parkour::kFailed)
+            {
+                Fail("The NPC does not have enough stamina for this move.", false);
+                return;
+            }
+
+            _MESSAGE("NPC test: ledge at (%.1f, %.1f, %.1f), start mark (%.1f, %.1f, %.1f)",
+                     ledge.x, ledge.y, ledge.z, start.x, start.y, start.z);
+        }
 
         // What the NPC's graph says before anything is sent. If the behaviour
         // patch is in this graph at all, these variables exist.
@@ -684,27 +784,6 @@ namespace
         s_trackedId = 0;
     }
 
-    // Starts a move on the tracked NPC. When `turn` is set she is first turned
-    // to `yaw` (the way the engine reads it: clockwise from north) and given the
-    // same moment to settle as the manual test; otherwise she is already facing
-    // what she is stuck on and the search runs on the very next tick.
-    void StartOn(Actor * npc, bool turn, float yaw)
-    {
-        s_manual    = false;
-        s_npc       = npc;
-        s_state     = kAligning;
-
-        if(turn)
-        {
-            Engine::Rotation(npc).z = yaw;
-            s_stateStart = GetTickCount();
-        }
-        else
-        {
-            s_stateStart = GetTickCount() - kAlignMs;
-        }
-    }
-
     void HandleTrack(Actor * player)
     {
         if(Parkour::MenuOpen()) return;
@@ -810,8 +889,11 @@ namespace
         // showed it on during ordinary running, and it must not hide the data.
         // It still stops her from being set off.
         const char * why = NULL;
-        const bool canAct       = NpcCanAct(npc, why, false);
-        const bool canLook      = canAct || NpcCanAct(npc, why, true);
+        // "Animation driven" is not a reason to hold back here: the first logs
+        // showed it on exactly while she was running into things, which is when
+        // she needs the help.
+        const bool canAct       = NpcCanAct(npc, why, true);
+        const bool canLook      = canAct;
 
         // The ledge search is the expensive part: twice a second at most, and only
         // while she is in trouble.
@@ -874,18 +956,19 @@ namespace
         // Which of the two searches, if any, is a shortcut worth taking.
         Parkour::Type chosen = Parkour::kNoLedge;
         float chosenGap = 0.0f, chosenLedgeZ = 0.0f;
+        NiPoint3 chosenStart(0.0f, 0.0f, 0.0f);
         bool turn = false;
         const char * source = "";
 
         if(typeToward != Parkour::kNoLedge && typeToward != Parkour::kFailed)
         {
-            chosen = typeToward; chosenGap = towardGap; chosenLedgeZ = ledgeToward.z;
+            chosen = typeToward; chosenGap = towardGap; chosenLedgeZ = ledgeToward.z; chosenStart = startToward;
             turn = true; source = "toward the player";
         }
         else if(typeOwn != Parkour::kNoLedge && typeOwn != Parkour::kFailed && dot > 0.0f)
         {
             const float gx = startOwn.x - pos.x, gy = startOwn.y - pos.y, gz = startOwn.z - pos.z;
-            chosen = typeOwn; chosenGap = sqrtf(gx * gx + gy * gy + gz * gz); chosenLedgeZ = ledgeOwn.z;
+            chosen = typeOwn; chosenGap = sqrtf(gx * gx + gy * gy + gz * gz); chosenLedgeZ = ledgeOwn.z; chosenStart = startOwn;
             turn = false; source = "the way she faces";
         }
 
@@ -913,7 +996,7 @@ namespace
         _MESSAGE("NPC track %08X: %s, %.0f units from the player: starting the move on its own",
                  (unsigned int)s_trackedId, detour ? "running round it" : "pushing against it", distance);
 
-        StartOn(npc, turn, atan2f(tx, ty));
+        StartOn(npc, turn, atan2f(tx, ty), false, chosen, chosenStart);
     }
 
     // The access violation caught, so that whatever is wrong with a pointer
@@ -986,6 +1069,8 @@ namespace NpcParkour
         s_autoDetourSec     = ReadFloat("fAutoDetourSec", s_autoDetourSec);
         s_autoMinApproach   = ReadFloat("fAutoMinApproach", s_autoMinApproach);
         s_autoMaxStartGap   = ReadFloat("fAutoMaxStartGap", s_autoMaxStartGap);
+        s_manualToward      = GetPrivateProfileIntA(kSection, "bManualTowardPlayer", s_manualToward ? 1 : 0, kIni) != 0;
+        s_manualMaxGap      = ReadFloat("fManualMaxStartGap", s_manualMaxGap);
         if(s_autoDetourSec < 1.0f)      s_autoDetourSec = 1.0f;
         if(s_autoDetourSec > 3.5f)      s_autoDetourSec = 3.5f;
         if(s_autoStuckSec < 0.5f)       s_autoStuckSec = 0.5f;
@@ -1059,6 +1144,7 @@ namespace NpcParkour
         s_state     = kIdle;
         s_requested = false;
         s_npc       = NULL;
+        s_planValid   = false;
         s_anchorReset = true;                   // the tracked NPC, if any, is kept
         ResetCorrection();
     }

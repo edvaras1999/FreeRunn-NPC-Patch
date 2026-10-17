@@ -57,7 +57,7 @@
 #include <shlobj.h>
 
 #define PLUGIN_NAME				"FreerunLE"
-#define PLUGIN_VERSION_STRING	"1.0.7-npc6"
+#define PLUGIN_VERSION_STRING	"1.0.7-npc7"
 #define PLUGIN_LOG_FILE			"\\My Games\\Skyrim\\SKSE\\FreerunLE.log"
 
 static PluginHandle			g_pluginHandle	= kPluginHandle_Invalid;
@@ -127,7 +127,10 @@ namespace
 			// marker could not appear no matter what the configuration menu said.
 			// Opening it with the HUD fixes both, and puts it on the same
 			// lifetime as the bar it sits beside.
-			if(event->menuName == hudMenu && event->opening)
+			// NPC TEST BUILD: only when the ledge marker is switched on. With it
+			// off, no menu of this mod exists at all, so there is nothing of ours
+			// that can sit on top of the inventory.
+			if(event->menuName == hudMenu && event->opening && Settings::showIndicators)
 			{
 				Indicator::Show();
 				Indicator::ShowDebugOverlay(Settings::debug);

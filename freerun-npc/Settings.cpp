@@ -8,7 +8,11 @@
 namespace Settings
 {
 	bool	enabled				= true;
-	bool	showIndicators		= true;
+	// NPC TEST BUILD: off by default, and read from the key the published
+	// version uses (bShowLedgeMarker). The older key, bShowIndicators, defaulted
+	// to ON: the "Freerun" menu was opened with every HUD, whatever the INI said,
+	// and an always-open menu of its own is what left the inventory unusable.
+	bool	showIndicators		= false;
 	float	playbackSpeed		= 0.95f;
 
 	bool	usePresetKey		= true;
@@ -81,7 +85,7 @@ namespace Settings
 	void Load()
 	{
 		enabled				= ReadBool ("Main",		"bEnabled",				enabled);
-		showIndicators		= ReadBool ("Main",		"bShowIndicators",		showIndicators);
+		showIndicators		= ReadBool ("Main",		"bShowLedgeMarker",		showIndicators);
 		playbackSpeed		= ReadFloat("Main",		"fPlaybackSpeed",		playbackSpeed);
 
 		usePresetKey		= ReadBool ("Input",	"bUsePresetKey",		usePresetKey);
@@ -111,7 +115,7 @@ namespace Settings
 	void Save()
 	{
 		WriteBool ("Main",		"bEnabled",			enabled);
-		WriteBool ("Main",		"bShowIndicators",	showIndicators);
+		WriteBool ("Main",		"bShowLedgeMarker",	showIndicators);
 		WriteFloat("Main",		"fPlaybackSpeed",	playbackSpeed);
 
 		WriteBool ("Input",		"bUsePresetKey",	usePresetKey);
