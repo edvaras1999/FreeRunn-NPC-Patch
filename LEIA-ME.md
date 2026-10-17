@@ -1,7 +1,12 @@
-# FreeRun LE + parkour em NPC (passo 2b, versão npc5)
+# FreeRun LE + parkour em NPC (passo 2b, versão npc6)
 
 Versão **de teste**, não para publicar. É o FreeRun LE 1.0.7 com um módulo novo para NPCs. Tudo o que acontece fica escrito no log (`Documentos\My Games\Skyrim\SKSE\FreerunLE.log`).
 
+> **Versão npc6, o que mudou:**
+> - **Crash ao deslizar (slide/dodge):** o `Engine.h` do FreeRun declarava `PlayerIsInMidair` (endereço `0x006AB2F0`) como função normal, mas é uma função-membro que recebe o jogador em ECX. Chamada assim, o motor lê um ECX qualquer, que dependia do compilador. O `Engine.h` e o `Engine.cpp` agora são os do teu FreeClimb LE, que já tem isto corrigido e valida a cadeia de ponteiros do jogador.
+> - **Pontaria do F10/F11:** em terceira pessoa passa a seguir a **câmara**, não o corpo.
+> - **O módulo NPC corre dentro de um bloco protegido contra exceções**, porque é chamado a partir de uma thread de trabalho da IA, e a seguidora seguida é esquecida ao carregar um save (um ponteiro guardado de um mundo antigo é um ponteiro para memória libertada).
+>
 > Aviso: não consegui compilar nem correr o jogo. A sintaxe do módulo novo foi verificada com os cabeçalhos do projeto (a parte de exceções do Windows só pelo compilador real). Se a compilação falhar, manda-me as linhas de erro do `build.log`.
 
 ## O que faz

@@ -57,7 +57,7 @@
 #include <shlobj.h>
 
 #define PLUGIN_NAME				"FreerunLE"
-#define PLUGIN_VERSION_STRING	"1.0.7-npc5"
+#define PLUGIN_VERSION_STRING	"1.0.7-npc6"
 #define PLUGIN_LOG_FILE			"\\My Games\\Skyrim\\SKSE\\FreerunLE.log"
 
 static PluginHandle			g_pluginHandle	= kPluginHandle_Invalid;
@@ -211,6 +211,7 @@ namespace
 			}
 
 			case SKSEMessagingInterface::kMessage_PreLoadGame:
+				NpcParkour::Forget();				// NPC test build: drop the tracked NPC at a load
 				Parkour::Reset();
 				Slide::Reset();
 				break;
@@ -245,6 +246,7 @@ namespace
 					_MESSAGE("the player has no 3D yet: leaving the graph alone");
 				}
 
+				NpcParkour::Forget();				// NPC test build: drop the tracked NPC at a load
 				Parkour::Reset();
 				Slide::Reset();
 				break;
@@ -264,6 +266,7 @@ namespace
 				//
 				// The playback speed does not need setting here either: the
 				// channel carries it into every graph the engine builds.
+				NpcParkour::Forget();				// NPC test build: drop the tracked NPC at a load
 				Parkour::Reset();
 				Slide::Reset();
 				break;

@@ -7,4 +7,4 @@ Esta compilação mantém a licença **AGPL-3.0** (ver `LICENSE`). As alteraçõ
 
 Não inclui nem redistribui o patch do Nemesis nem as animações: é preciso ter o FreeRun LE instalado.
 
-`Havok.h` e `Havok.cpp` vêm do projeto FreeClimb LE (FreeClimbe-Beta), com ajustes mínimos marcados `NPC TEST BUILD`.
+`Havok.h`, `Havok.cpp`, `Engine.h` e `Engine.cpp` vêm do projeto FreeClimb LE (FreeClimbe-Beta), `Havok.*` com ajustes mínimos marcados `NPC TEST BUILD`.

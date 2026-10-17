@@ -19,6 +19,38 @@
 
 namespace Engine
 {
+	// ------------------------------------------------- reading the game safely
+	//
+	// See the long note in Engine.cpp. Nothing in this plugin walks a pointer
+	// chain into the game by hand any more. A tester's crash log caught the
+	// engine's OWN GetCharController faulting on a middle-process pointer that
+	// was not even aligned to four, moments after a save finished loading,
+	// because this mod had asked for the controller while the game was still
+	// rebuilding it.
+
+	// Can this process read `length` bytes there? Non-null, aligned, committed.
+	bool Readable(const void * address, size_t length);
+
+	// The pointer stored at object + offset, or null if either end is unreadable.
+	void * Link(const void * object, UInt32 offset);
+
+	// Forgets what it knows about which memory is committed. Called when the game
+	// has had a chance to unmap something.
+	void ForgetMemoryLayout();
+
+	struct Chain
+	{
+		void * process;			// actor + 0x88
+		void * middle;			// process + 0x04
+		void * controller;		// middle + 0x15C
+	};
+
+	// Every link of the actor -> controller chain, or false and nothing.
+	bool ActorChain(void * actor, Chain & out);
+
+	// Is this actor far enough along to be asked anything? 3D, and a whole chain.
+	bool ActorIsBuilt(void * actor);
+
 	// ---------------------------------------------------------------- units
 
 	// The physics world runs in metres, the game world in units. Every vector
@@ -83,10 +115,19 @@ namespace Engine
 	// IMovementState, the vtable of the ActorState subobject at actor + 0x64.
 	// Slot 5 returns the movement speed the engine itself uses for the
 	// "IsMoving" condition (0x005048C0 compares it against 5.0).
+	// Virtual, on a subobject of the actor, and it reaches the character
+	// controller inside - so it answers nothing for an actor the game is still
+	// putting together.
 	inline float MovementSpeed(Actor * actor)
 	{
+		Chain chain;
+		if(!ActorChain(actor, chain)) return 0.0f;
+
 		void * state = (UInt8 *)actor + 0x64;
-		float (__thiscall * fn)(void *) = *(float (__thiscall **)(void *))(*(UInt32 *)state + 5 * 4);
+		void ** vtable = *(void ***)state;
+		if(!Readable(vtable, 6 * sizeof(void *))) return 0.0f;
+
+		float (__thiscall * fn)(void *) = (float (__thiscall *)(void *))vtable[5];
 		return fn(state);
 	}
 
@@ -97,16 +138,24 @@ namespace Engine
 
 	inline float GetActorValue(Actor * actor, UInt32 av)
 	{
+		if(!Readable(actor, 0x64)) return 0.0f;
 		void * owner = (UInt8 *)actor + 0x60;
-		float (__thiscall * fn)(void *, UInt32) = *(float (__thiscall **)(void *, UInt32))(*(UInt32 *)owner + 1 * 4);
+		void ** vtable = *(void ***)owner;
+		if(!Readable(vtable, 2 * sizeof(void *))) return 0.0f;
+
+		float (__thiscall * fn)(void *, UInt32) = (float (__thiscall *)(void *, UInt32))vtable[1];
 		return fn(owner, av);
 	}
 
 	inline void DamageActorValue(Actor * actor, UInt32 av, float amount)
 	{
+		if(!Readable(actor, 0x64)) return;
 		void * owner = (UInt8 *)actor + 0x60;
+		void ** vtable = *(void ***)owner;
+		if(!Readable(vtable, 7 * sizeof(void *))) return;
+
 		void (__thiscall * fn)(void *, UInt32, UInt32, float) =
-			*(void (__thiscall **)(void *, UInt32, UInt32, float))(*(UInt32 *)owner + 6 * 4);
+			(void (__thiscall *)(void *, UInt32, UInt32, float))vtable[6];
 		fn(owner, 2 /* damage modifier */, av, -amount);
 	}
 
@@ -114,7 +163,7 @@ namespace Engine
 	// 0x0074F5F7.
 	inline void UpdateRegenDelay(Actor * actor, UInt32 av, float delay)
 	{
-		void * process = *(void **)((UInt8 *)actor + 0x88);
+		void * process = Link(actor, 0x88);
 		if(!process) return;
 		typedef void (__thiscall * fn_t)(void *, UInt32, float);
 		((fn_t)0x006FCC90)(process, av, delay);
@@ -129,10 +178,24 @@ namespace Engine
 
 	// The player is in the air when the character controller's Havok state is
 	// hkpCharacterStateType::kInAir. 0x006AB2F0 is the engine's own answer.
+	//
+	// And the engine's own answer walks the player's process chain with a single
+	// null check, which is what killed a tester's game moments after a load: the
+	// chain was half rebuilt and the middle link read as an odd number. The
+	// engine is in no position to doubt that pointer; this mod is, so the chain
+	// is checked here before the question is asked.
 	inline bool PlayerIsInMidair()
 	{
-		typedef bool (__cdecl * fn_t)(void);
-		return ((fn_t)0x006AB2F0)();
+		// 0x006AB2F0 is a member function: the engine loads the actor into ECX
+		// and calls it (see 0x006AF9E7, 0x006C2F1C, 0x00739985). It is NOT a
+		// free function - calling it as one leaves ECX as whatever the compiler
+		// last put there, and the very next thing it does is read through it.
+		void * player = Player();
+		Chain chain;
+		if(!ActorChain(player, chain)) return false;
+
+		typedef bool (__thiscall * fn_t)(void * actor);
+		return ((fn_t)0x006AB2F0)(player);
 	}
 
 	// ------------------------------------------------- character controller
@@ -167,11 +230,8 @@ namespace Engine
 
 	inline void * CharController(Actor * actor)
 	{
-		void * process = *(void **)((UInt8 *)actor + 0x88);
-		if(!process) return NULL;
-		void * middle = *(void **)((UInt8 *)process + 0x04);
-		if(!middle) return NULL;
-		return *(void **)((UInt8 *)middle + 0x15C);
+		Chain chain;
+		return ActorChain(actor, chain) ? chain.controller : NULL;
 	}
 
 	inline UInt32 & ControllerFlags(void * ctrl)		{ return *(UInt32 *)((UInt8 *)ctrl + Controller::kFlags); }
@@ -222,57 +282,77 @@ namespace Engine
 	// GetAnimationVariableBool (0x00903390) calls slot 0x12 on it.
 	inline void * GraphHolder(TESObjectREFR * ref)	{ return (UInt8 *)ref + 0x20; }
 
+	// The holder's table, checked as far as the slot being called.
+	//
+	// The holder is a subobject of the reference, so a reference the game is
+	// building or tearing down has one too - with whatever table pointer the
+	// memory happened to hold. Every call below goes through this.
+	inline void ** HolderVtable(TESObjectREFR * ref, UInt32 slot)
+	{
+		if(!Readable(ref, 0x24)) return NULL;
+		void ** vtable = *(void ***)((UInt8 *)ref + 0x20);
+		return Readable(vtable, (slot + 1) * sizeof(void *)) ? vtable : NULL;
+	}
+
 	inline bool GetGraphVariableBool(TESObjectREFR * ref, const BSFixedString & name, bool & out)
 	{
-		void * holder = GraphHolder(ref);
+		void ** vtable = HolderVtable(ref, 0x12);
+		if(!vtable) return false;
 		typedef bool (__thiscall * fn_t)(void *, const BSFixedString &, bool &);
-		return (*(fn_t **)holder)[0x12](holder, name, out);
+		return ((fn_t)vtable[0x12])(GraphHolder(ref), name, out);
 	}
 
 	inline bool GetGraphVariableInt(TESObjectREFR * ref, const BSFixedString & name, SInt32 & out)
 	{
-		void * holder = GraphHolder(ref);
+		void ** vtable = HolderVtable(ref, 0x11);
+		if(!vtable) return false;
 		typedef bool (__thiscall * fn_t)(void *, const BSFixedString &, SInt32 &);
-		return (*(fn_t **)holder)[0x11](holder, name, out);
+		return ((fn_t)vtable[0x11])(GraphHolder(ref), name, out);
 	}
 
 	inline bool GetGraphVariableFloat(TESObjectREFR * ref, const BSFixedString & name, float & out)
 	{
-		void * holder = GraphHolder(ref);
+		void ** vtable = HolderVtable(ref, 0x10);
+		if(!vtable) return false;
 		typedef bool (__thiscall * fn_t)(void *, const BSFixedString &, float &);
-		return (*(fn_t **)holder)[0x10](holder, name, out);
+		return ((fn_t)vtable[0x10])(GraphHolder(ref), name, out);
 	}
 
 	inline bool SetGraphVariableBool(TESObjectREFR * ref, const BSFixedString & name, bool value)
 	{
+		if(!Readable(ref, 0x24)) return false;
 		typedef bool (__thiscall * fn_t)(void *, const BSFixedString &, bool);
 		return ((fn_t)0x00650C60)(GraphHolder(ref), name, value);
 	}
 
 	inline bool SetGraphVariableInt(TESObjectREFR * ref, const BSFixedString & name, SInt32 value)
 	{
+		if(!Readable(ref, 0x24)) return false;
 		typedef bool (__thiscall * fn_t)(void *, const BSFixedString &, SInt32);
 		return ((fn_t)0x00650C80)(GraphHolder(ref), name, value);
 	}
 
 	inline bool SetGraphVariableFloat(TESObjectREFR * ref, const BSFixedString & name, float value)
 	{
+		if(!Readable(ref, 0x24)) return false;
 		typedef bool (__thiscall * fn_t)(void *, const BSFixedString &, float);
 		return ((fn_t)0x00650CA0)(GraphHolder(ref), name, value);
 	}
 
 	inline bool NotifyAnimationGraph(TESObjectREFR * ref, const BSFixedString & event)
 	{
-		void * holder = GraphHolder(ref);
+		void ** vtable = HolderVtable(ref, 0x01);
+		if(!vtable) return false;
 		typedef bool (__thiscall * fn_t)(void *, const BSFixedString &);
-		return (*(fn_t **)holder)[0x01](holder, event);
+		return ((fn_t)vtable[0x01])(GraphHolder(ref), event);
 	}
 
 	inline bool GetAnimationGraphManager(TESObjectREFR * ref, void *& outManagerPtr)
 	{
-		void * holder = GraphHolder(ref);
+		void ** vtable = HolderVtable(ref, 0x02);
+		if(!vtable) return false;
 		typedef bool (__thiscall * fn_t)(void *, void **);
-		return (*(fn_t **)holder)[0x02](holder, &outManagerPtr);
+		return ((fn_t)vtable[0x02])(GraphHolder(ref), &outManagerPtr);
 	}
 
 	// BSAnimationGraphManager, laid out by the constructor at 0x00BA7B60 and
@@ -333,6 +413,47 @@ namespace Engine
 		if(!map) return;
 		typedef void (__thiscall * fn_t)(void *, UInt32, bool, bool);
 		((fn_t)0x00A67A30)(map, flags, enable, true);
+	}
+
+	// Whether this plugin is the one holding jumping and the main four shut. The
+	// main four are the tween menu and the inventory / magic / map / skills keys,
+	// on a gamepad as on a keyboard: a stop event that never arrives (a ragdoll, a
+	// reset, a load, a slide the behaviour refused) used to leave them shut for the
+	// rest of the session. Every place that shuts them goes through here, and the
+	// tick gives them back the moment nothing of ours is running.
+	extern bool ActionControlsHeld;
+
+	inline void HoldActionControls(bool hold)
+	{
+		ToggleControls(kControl_Jumping, !hold);
+		ToggleControls(kControl_MainFour, !hold);
+		ActionControlsHeld = hold;
+	}
+
+	inline void ReleaseActionControls()
+	{
+		if(ActionControlsHeld) HoldActionControls(false);
+	}
+
+	// The control map's enabled flags travel in the save. A save made while an
+	// older build had the main four shut - or one of this build's own holds that
+	// never got its end event - loads with them still shut and with nobody
+	// holding them, so ReleaseActionControls has nothing to give back. The
+	// signature is specific: jumping and/or the main four off while movement,
+	// looking, fighting and the menu are all on. A scripted lock-out (the
+	// opening cart, a cutscene) turns off movement and the rest with them, and
+	// is left alone. Returns true if it opened anything.
+	inline bool RepairStuckControls(UInt32 & before)
+	{
+		before = EnabledControls();
+		const UInt32 core = kControl_Movement | kControl_Looking | kControl_Fighting | kControl_Menu;
+		if((before & core) != core) return false;
+
+		const UInt32 ours = kControl_Jumping | kControl_MainFour;
+		if((before & ours) == ours) return false;
+
+		ToggleControls(ours & ~before, true);
+		return true;
 	}
 
 	// PlayerControls' movement data starts at + 0x14; autoMove is data + 0x24
@@ -403,8 +524,14 @@ namespace Engine
 	// SKSE headers; the third person root is what carries the actor's scale.
 	inline NiNode * Get3D(TESObjectREFR * ref, bool firstPerson)
 	{
-		if(!ref) return NULL;
+		// A virtual call, so the reference and the table it carries both have to
+		// be there. A reference that is being torn down is the normal case here,
+		// not the exceptional one.
+		if(!Readable(ref, sizeof(void *))) return NULL;
+		void ** vtable = *(void ***)ref;
+		if(!Readable(vtable, (0x6F + 1) * sizeof(void *))) return NULL;
+
 		typedef NiNode * (__thiscall * fn_t)(void *, UInt32);
-		return (*(fn_t **)ref)[0x6F](ref, firstPerson ? 1 : 0);
+		return ((fn_t)vtable[0x6F])(ref, firstPerson ? 1 : 0);
 	}
 }

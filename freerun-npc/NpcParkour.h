@@ -33,5 +33,6 @@ namespace NpcParkour
     void    RequestTest();              // the test key was pressed
     void    RequestTrack();             // the track key was pressed
     void    OnTick(Actor * player);     // once per animation update of the player
-    void    Reset();                    // load, new game, graph rebuilt: forget the running move
+    void    Reset();                    // graph rebuilt: forget the running move (the tracked NPC is kept)
+    void    Forget();                   // a load or a new game: forget the running move AND the tracked NPC
 }

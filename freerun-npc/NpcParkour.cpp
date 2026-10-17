@@ -324,9 +324,23 @@ namespace
 
     // ---- 1. aim -------------------------------------------------------------
 
+    // Where the player is aiming: where the camera looks in third person, where
+    // the body faces otherwise. In third person the two are often different, and
+    // the player looks at the NPC with the camera.
+    NiPoint3 AimDirection(Actor * player)
+    {
+        void * state = Engine::CameraState();
+        if(state && Engine::CameraStateID(state) == Engine::kCameraState_ThirdPerson)
+        {
+            const float yaw = *(float *)((UInt8 *)state + Engine::ThirdPerson::kTargetYaw);
+            return NiPoint3(sinf(yaw), cosf(yaw), 0.0f);
+        }
+        return Parkour::FacingFlat(player);
+    }
+
     Actor * FindTarget(Actor * player)
     {
-        const NiPoint3 facing = Parkour::FacingFlat(player);
+        const NiPoint3 facing = AimDirection(player);
         if(facing.x == 0.0f && facing.y == 0.0f)
         {
             _MESSAGE("NPC test: the player has no facing yet");
@@ -336,7 +350,9 @@ namespace
         const NiPoint3 pos = Engine::Position(player);
         const NiPoint3 start(pos.x, pos.y, pos.z + 100.0f);
 
-        const Havok::Result r = Havok::ShapeCast(start, facing, s_maxDistance, 40.0f,
+        _MESSAGE("NPC test: aiming (%.2f, %.2f) from (%.0f, %.0f, %.0f)", facing.x, facing.y, start.x, start.y, start.z);
+
+        const Havok::Result r = Havok::ShapeCast(start, facing, s_maxDistance, 50.0f,
                                                  Havok::kLayer_Transparent, player);
         _MESSAGE("NPC test: the aim cast (%.0f units) found %u hit(s)", s_maxDistance, (unsigned int)r.hitCount);
 
@@ -377,7 +393,7 @@ namespace
         Actor * npc = FindTarget(player);
         if(!npc)
         {
-            Fail("No NPC found in front of you.\n\nStand facing the NPC, closer than the configured distance, with nothing solid between you.", false);
+            Fail("No NPC found where you are looking.\n\nLook straight at the NPC (in third person the camera is what aims), closer than the configured distance.", false);
             return;
         }
 
@@ -697,7 +713,7 @@ namespace
         if(!npc)
         {
             _MESSAGE("NPC track: no NPC found in front of the player");
-            ShowText("FreeRun NPC: no NPC found in front of you.\n\nStand facing the NPC you want to track.");
+            ShowText("FreeRun NPC: no NPC found where you are looking.\n\nLook straight at the NPC you want to track (the camera aims in third person).");
             return;
         }
 
@@ -915,6 +931,34 @@ namespace
             s_trackedId = 0;
         }
     }
+
+    void TickInner(Actor * player)
+    {
+        if(s_state == kIdle)
+        {
+            if(s_requested)
+            {
+                s_requested = false;
+                if(GetTickCount() - s_requestedAt <= kRequestTtlMs)     // stale: a menu held the tick back
+                    Begin(player);
+                return;
+            }
+
+            if(s_trackRequested)
+            {
+                s_trackRequested = false;
+                if(GetTickCount() - s_trackRequestedAt <= kRequestTtlMs)
+                    HandleTrack(player);
+                return;
+            }
+
+            if(s_tracked)
+                SafeTrackTick(player);
+            return;
+        }
+
+        Step();
+    }
 }
 
 namespace NpcParkour
@@ -981,39 +1025,35 @@ namespace NpcParkour
 
     // Once per animation update of the player. The common case - nothing
     // requested, nothing running, nothing tracked - is a handful of comparisons.
+    //
+    // The whole module runs inside an exception guard. This code is called from
+    // an AI worker thread, while other threads change the very actors it looks
+    // at, so a pointer that was good a moment ago can stop being good. Whatever
+    // goes wrong here ends the NPC module's work and not the game.
     void OnTick(Actor * player)
     {
-        if(s_state == kIdle)
+        __try
         {
-            if(s_requested)
-            {
-                s_requested = false;
-                if(GetTickCount() - s_requestedAt <= kRequestTtlMs)     // stale: a menu held the tick back
-                    Begin(player);
-                return;
-            }
-
-            if(s_trackRequested)
-            {
-                s_trackRequested = false;
-                if(GetTickCount() - s_trackRequestedAt <= kRequestTtlMs)
-                    HandleTrack(player);
-                return;
-            }
-
-            if(s_tracked)
-                SafeTrackTick(player);
-            return;
+            TickInner(player);
         }
-
-        Step();
+        __except(EXCEPTION_EXECUTE_HANDLER)
+        {
+            _ERROR("NPC: an exception inside the NPC module: its work is stopped here and the game goes on");
+            s_state             = kIdle;
+            s_npc               = NULL;
+            s_requested         = false;
+            s_trackRequested    = false;
+            s_tracked           = NULL;
+            s_trackedId         = 0;
+            ResetCorrection();
+        }
     }
 
     void Reset()
     {
         // A graph rebuild or a load in the middle of a test: if the NPC is
         // still a live actor, give its physics back before forgetting it.
-        if(s_state != kIdle && s_npc && NpcUsable(s_npc))
+        if(s_state != kIdle && s_npc && SafeUsable(s_npc))
             ReleaseNpc(s_npc, false);
 
         s_state     = kIdle;
@@ -1021,5 +1061,16 @@ namespace NpcParkour
         s_npc       = NULL;
         s_anchorReset = true;                   // the tracked NPC, if any, is kept
         ResetCorrection();
+    }
+
+    // A load or a new game: the actors of the old world are gone, and a pointer
+    // kept across that is a pointer to freed memory.
+    void Forget()
+    {
+        Reset();
+        if(s_tracked)
+            _MESSAGE("NPC track: %08X forgotten (a load or a new game)", (unsigned int)s_trackedId);
+        s_tracked   = NULL;
+        s_trackedId = 0;
     }
 }
