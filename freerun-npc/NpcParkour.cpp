@@ -70,6 +70,8 @@ namespace
     float   s_trailEndRadius    = 220.0f;   // she has caught up when this close, and level
     float   s_trailMaxSec       = 45.0f;    // longest a replay may last
     float   s_trailSpacing      = 40.0f;    // a trail node every this many units
+    bool    s_trailWalk         = false;    // true: she also WALKS the player's path (experimental); false: she only repeats his moves
+    float   s_trailMoveRadius   = 120.0f;   // she repeats a move of the player's when she is this close to its start mark
     bool    s_manualToward      = true;     // F10: try the ledge between her and the player, from where she stands
     float   s_manualMaxGap      = 150.0f;   // F10: how far from the start mark she may be
 
@@ -133,15 +135,19 @@ namespace
         bool    initialised;
         bool    done;
         DWORD   last;
+        float   remaining;      // havok units still to cover
+        float   dir[3];         // the direction of the original gap, normalised
     };
 
-    Correction s_corr = { false, false, 0 };
+    Correction s_corr = { false, false, 0, 0.0f, { 0.0f, 0.0f, 0.0f } };
 
     void ResetCorrection()
     {
         s_corr.initialised  = false;
         s_corr.done         = false;
         s_corr.last         = 0;
+        s_corr.remaining    = 0.0f;
+        s_corr.dir[0] = s_corr.dir[1] = s_corr.dir[2] = 0.0f;
     }
 
     // ---- small helpers ------------------------------------------------------
@@ -234,43 +240,58 @@ namespace
         Engine::ControllerGetPosition(ctrl, current, true);
 
         const float scale = Engine::HavokScale();
-        const float mx = s_start.x * scale - current[0];
-        const float my = s_start.y * scale - current[1];
-        const float mz = s_start.z * scale - current[2];
-        const float distance = sqrtf(mx * mx + my * my + mz * mz);
-
         const DWORD now = GetTickCount();
         float dt = 1.0f / 60.0f;
-        if(s_corr.initialised)
-            dt = (float)(now - s_corr.last) / 1000.0f;
-        if(dt > 0.1f) dt = 0.1f;
-        if(dt <= 0.0f) dt = 1.0f / 60.0f;
-        s_corr.last = now;
 
         if(!s_corr.initialised)
         {
+            // The gap is measured ONCE, and what is covered is that gap along its
+            // original direction. Measuring it again every tick would drag her
+            // back toward the mark while the animation's own movement carries her
+            // away from it, and that is exactly how seven of thirteen repeated
+            // moves ended without lifting her at all.
+            const float mx = s_start.x * scale - current[0];
+            const float my = s_start.y * scale - current[1];
+            const float mz = s_start.z * scale - current[2];
+            const float distance = sqrtf(mx * mx + my * my + mz * mz);
+
             s_corr.initialised = true;
+            s_corr.remaining   = distance;
+            if(distance > 0.0001f)
+            {
+                s_corr.dir[0] = mx / distance;
+                s_corr.dir[1] = my / distance;
+                s_corr.dir[2] = mz / distance;
+            }
+            s_corr.done = (distance <= 2.0f * scale);
+
             _MESSAGE("NPC test: start mark is %.1f game units away", distance / scale);
         }
+        else
+        {
+            dt = (float)(now - s_corr.last) / 1000.0f;
+        }
+
+        s_corr.last = now;
+        if(dt > 0.1f) dt = 0.1f;
+        if(dt <= 0.0f) dt = 1.0f / 60.0f;
 
         if(s_corr.done) return;
 
-        if(distance <= 2.0f * scale)
-        {
-            s_corr.done = true;
-            return;
-        }
-
-        const float maxStep = s_dashSpeed * scale * dt;
-        const float k = (distance <= maxStep) ? 1.0f : maxStep / distance;
+        float step = s_dashSpeed * scale * dt;
+        if(step > s_corr.remaining) step = s_corr.remaining;
 
         __declspec(align(16)) float target[4];
-        target[0] = current[0] + mx * k;
-        target[1] = current[1] + my * k;
-        target[2] = current[2] + mz * k;
+        target[0] = current[0] + s_corr.dir[0] * step;
+        target[1] = current[1] + s_corr.dir[1] * step;
+        target[2] = current[2] + s_corr.dir[2] * step;
         target[3] = 0.0f;
 
         Engine::ControllerSetPosition(ctrl, target, true, false);
+
+        s_corr.remaining -= step;
+        if(s_corr.remaining <= 0.0001f)
+            s_corr.done = true;
     }
 
     // ---- ending a test ------------------------------------------------------
@@ -655,7 +676,7 @@ namespace
 
         s_trail[s_trailCount++] = node;
 
-        if(s_trailCount % 50 == 0)
+        if(s_trailCount % 50 == 0 && s_trailCount < (UInt32)kTrailMax)
             _MESSAGE("NPC trail: %u nodes", (unsigned int)s_trailCount);
     }
 
@@ -723,9 +744,75 @@ namespace
         TrailAppend(MakeWalkNode(pos, now));
     }
 
-    // The node nearest her, if the trail from there to the player is whole.
-    bool FindTrailEntry(const NiPoint3 & pos, UInt32 & entry, float & distance, const char *& why)
+    // Is the way from `from` to `to` free of anything solid, at waist height? A
+    // sphere is swept along it, and characters are not counted.
+    bool PathClear(Actor * npc, const NiPoint3 & from, const NiPoint3 & to)
     {
+        const float dx = to.x - from.x;
+        const float dy = to.y - from.y;
+        const float horizontal = sqrtf(dx * dx + dy * dy);
+        if(horizontal < 5.0f) return true;
+
+        const NiPoint3 start(from.x, from.y, from.z + 45.0f);
+        const NiPoint3 direction(dx / horizontal, dy / horizontal, 0.0f);
+
+        const Havok::Result r = Havok::ShapeCast(start, direction, horizontal, 20.0f, Havok::kLayer_Transparent, npc);
+        for(UInt32 h = 0; h < r.hitCount; ++h)
+        {
+            const Havok::Hit & hit = r.hits[h];
+            if(hit.layer == Havok::kLayer_CharController || hit.layer == Havok::kLayer_Biped) continue;
+            if(hit.distance < horizontal - 10.0f) return false;
+        }
+        return true;
+    }
+
+    // Where she joins the player's trail.
+    //
+    // Walking mode: the node nearest her, if the trail from there to the player
+    // is whole. Moves-only mode (the default): the nearest MOVE of the player's
+    // whose start mark is within reach, that would lift her, and with a clear way
+    // to its start mark. She is not driven anywhere else: the AI brings her to
+    // the foot of the wall on its own, since it is following the player there.
+    bool FindTrailEntry(Actor * npc, const NiPoint3 & pos, UInt32 & entry, float & distance, const char *& why)
+    {
+        if(!s_trailWalk)
+        {
+            float best = 1.0e9f;
+            UInt32 bestIndex = 0;
+            bool found = false;
+
+            for(UInt32 i = 0; i < s_trailCount; ++i)
+            {
+                const TrailNode & node = s_trail[i];
+                if(!node.isMove) continue;
+
+                const float rise = (node.hasEnd ? node.end.z : node.pos.z + 80.0f) - pos.z;
+                if(rise < 40.0f) continue;                      // it would not lift her
+
+                const float dx = pos.x - node.pos.x;
+                const float dy = pos.y - node.pos.y;
+                const float dz = pos.z - node.pos.z;
+                const float d = sqrtf(dx * dx + dy * dy + dz * dz);
+                if(d < best) { best = d; bestIndex = i; found = true; }
+            }
+
+            if(!found || best > s_trailMoveRadius)
+            {
+                why = "no move of the player's starts within her reach (or none would lift her)";
+                return false;
+            }
+
+            if(!PathClear(npc, pos, s_trail[bestIndex].pos))
+            {
+                why = "something solid is between her and that move's start mark";
+                return false;
+            }
+
+            entry    = bestIndex;
+            distance = best;
+            return true;
+        }
+
         float best = 1.0e9f;
         UInt32 bestIndex = 0;
 
@@ -766,10 +853,16 @@ namespace
         for(UInt32 i = entry; i < s_trailCount; ++i)
             if(s_trail[i].isMove) ++moves;
 
-        _MESSAGE("NPC track %08X: the player is %.0f above her, %.0f away, and she is not getting closer: "
-                 "following his path from node %u of %u (%.0f units from her), %u moves ahead",
-                 (unsigned int)s_trackedId, heightGap, distance, (unsigned int)entry,
-                 (unsigned int)s_trailCount, entryDistance, (unsigned int)moves);
+        if(s_trailWalk)
+            _MESSAGE("NPC track %08X: the player is %.0f above her, %.0f away, and she is not getting closer: "
+                     "following his path from node %u of %u (%.0f units from her), %u moves ahead",
+                     (unsigned int)s_trackedId, heightGap, distance, (unsigned int)entry,
+                     (unsigned int)s_trailCount, entryDistance, (unsigned int)moves);
+        else
+            _MESSAGE("NPC track %08X: the player is %.0f above her, %.0f away, and she is not getting closer: "
+                     "his %s (node %u of %u) starts %.0f units from her: going to its start mark to repeat it",
+                     (unsigned int)s_trackedId, heightGap, distance, TypeName(s_trail[entry].type),
+                     (unsigned int)entry, (unsigned int)s_trailCount, entryDistance);
 
         s_manual        = false;
         s_npc           = npc;
@@ -803,9 +896,30 @@ namespace
         ResetCorrection();
     }
 
+    // The ground under (x, y), near height z, from a ray cast straight down.
+    bool GroundAt(Actor * npc, float x, float y, float z, float & outZ)
+    {
+        const NiPoint3 above(x, y, z + 80.0f);
+        const NiPoint3 down(0.0f, 0.0f, -1.0f);
+        const Havok::Result r = Havok::RayCast(above, down, 240.0f, Havok::kLayer_Transparent, npc);
+
+        for(UInt32 h = 0; h < r.hitCount; ++h)
+        {
+            const Havok::Hit & hit = r.hits[h];
+            if(hit.layer == Havok::kLayer_CharController || hit.layer == Havok::kLayer_Biped) continue;
+            outZ = hit.position.z;
+            return true;
+        }
+        return false;
+    }
+
     // One step toward `target` (game coordinates) at `speed` game units a second.
-    // Returns how far is left after the step.
-    float TrailMoveToward(Actor * npc, void * ctrl, const NiPoint3 & target, float dt, float speed)
+    // Returns how far is left after the step. She turns toward where she is going
+    // at a limited rate, because snapping her heading every tick made the run
+    // animation lean as if she were cornering hard. With `snap` set she is also
+    // put back on the ground under her, so that walking a path over uneven
+    // ground cannot take her below it.
+    float TrailMoveToward(Actor * npc, void * ctrl, const NiPoint3 & target, float dt, float speed, bool snap)
     {
         __declspec(align(16)) float current[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
         Engine::ControllerGetPosition(ctrl, current, true);
@@ -826,10 +940,29 @@ namespace
         next[1] = current[1] + my * k;
         next[2] = current[2] + mz * k;
         next[3] = 0.0f;
+
+        if(snap)
+        {
+            float groundZ = 0.0f;
+            if(GroundAt(npc, next[0] / scale, next[1] / scale, next[2] / scale, groundZ))
+                next[2] = groundZ * scale;
+        }
+
         Engine::ControllerSetPosition(ctrl, next, true, false);
 
-        if(fabsf(mx) + fabsf(my) > 2.0f * scale)                // face where she is going
-            Engine::Rotation(npc).z = atan2f(mx, my);
+        if(fabsf(mx) + fabsf(my) > 2.0f * scale)
+        {
+            const float want = atan2f(mx, my);
+            const float have = Engine::Rotation(npc).z;
+            float diff = want - have;
+            while(diff >  3.14159265f) diff -= 6.28318531f;
+            while(diff < -3.14159265f) diff += 6.28318531f;
+
+            const float maxTurn = 5.0f * dt;                    // radians a second
+            if(diff >  maxTurn) diff =  maxTurn;
+            if(diff < -maxTurn) diff = -maxTurn;
+            Engine::Rotation(npc).z = have + diff;
+        }
 
         return (left <= stepGame) ? 0.0f : left - stepGame;
     }
@@ -891,7 +1024,7 @@ namespace
         }
 
         const TrailNode node = s_trail[s_trailIdx];
-        const float left = TrailMoveToward(npc, ctrl, node.pos, dt, s_trailSpeed);
+        const float left = TrailMoveToward(npc, ctrl, node.pos, dt, s_trailWalk ? s_trailSpeed : s_dashSpeed, s_trailWalk && !node.isMove);
 
         if(!node.isMove)
         {
@@ -925,6 +1058,15 @@ namespace
                  (unsigned long)took, s_posBefore.x, s_posBefore.y, s_posBefore.z, after.x, after.y, after.z);
 
         // On the trail she is not handed back yet: the next node is waiting.
+        if(s_trailRun && !s_trailWalk)
+        {
+            // One move repeated is the whole job. The AI takes her from here, and
+            // the next foot of a wall gets its own entry, after a short pause.
+            TrailEnd(npc, "repeated the player's move", true);
+            s_cooldownUntil = GetTickCount() + 2000;
+            return;
+        }
+
         if(s_trailRun)
         {
             ++s_trailIdx;
@@ -1255,7 +1397,7 @@ namespace
                 float entryDistance = 0.0f;
                 const char * noTrail = NULL;
 
-                if(FindTrailEntry(pos, entry, entryDistance, noTrail))
+                if(FindTrailEntry(npc, pos, entry, entryDistance, noTrail))
                 {
                     StartTrail(npc, entry, entryDistance, heightGap, distance);
                     return;
@@ -1455,6 +1597,10 @@ namespace NpcParkour
         s_trailEndRadius    = ReadFloat("fTrailEndRadius", s_trailEndRadius);
         s_trailMaxSec       = ReadFloat("fTrailMaxSec", s_trailMaxSec);
         s_trailSpacing      = ReadFloat("fTrailSpacing", s_trailSpacing);
+        s_trailWalk         = GetPrivateProfileIntA(kSection, "bTrailWalk", s_trailWalk ? 1 : 0, kIni) != 0;
+        s_trailMoveRadius   = ReadFloat("fTrailMoveRadius", s_trailMoveRadius);
+        if(s_trailMoveRadius < 30.0f)   s_trailMoveRadius = 30.0f;
+        if(s_trailMoveRadius > 300.0f)  s_trailMoveRadius = 300.0f;
         if(s_dashSpeed < 100.0f)        s_dashSpeed = 100.0f;
         if(s_trailSpeed < 100.0f)       s_trailSpeed = 100.0f;
         if(s_trailSpeed > 700.0f)       s_trailSpeed = 700.0f;
