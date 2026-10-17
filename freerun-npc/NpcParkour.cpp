@@ -61,7 +61,15 @@ namespace
     float   s_autoCooldownSec   = 6.0f;     // pause between two automatic moves
     float   s_autoDetourSec     = 3.0f;     // the window in which she must have come no closer
     float   s_autoMinApproach   = 30.0f;    // ... by less than this many units, to count as a detour
-    float   s_autoMaxStartGap   = 90.0f;    // she must already be this close to the move's start mark
+    float   s_autoMaxStartGap   = 30.0f;    // she must already be this close to the move's start mark
+    float   s_dashSpeed         = 420.0f;   // game units a second: how fast she is brought to a start mark
+    bool    s_trailEnabled      = true;     // the player's trail (step 3)
+    float   s_trailMinHeight    = 120.0f;   // the player must be at least this far above her
+    float   s_trailJoinRadius   = 350.0f;   // she joins the trail at a node at most this far from her
+    float   s_trailSpeed        = 330.0f;   // game units a second along the trail
+    float   s_trailEndRadius    = 220.0f;   // she has caught up when this close, and level
+    float   s_trailMaxSec       = 45.0f;    // longest a replay may last
+    float   s_trailSpacing      = 40.0f;    // a trail node every this many units
     bool    s_manualToward      = true;     // F10: try the ledge between her and the player, from where she stands
     float   s_manualMaxGap      = 150.0f;   // F10: how far from the start mark she may be
 
@@ -76,7 +84,7 @@ namespace
 
     // ---- state: one NPC at a time -------------------------------------------
 
-    enum State { kIdle, kAligning, kWaitStart, kRunning };
+    enum State { kIdle, kAligning, kWaitStart, kRunning, kTrail };
 
     State           s_state         = kIdle;
     bool            s_requested     = false;
@@ -95,6 +103,13 @@ namespace
     bool            s_trackRequested    = false;
     DWORD           s_trackRequestedAt  = 0;
     bool            s_manual            = true;     // the running move came from the key
+    bool            s_trailRun          = false;    // a trail replay is running
+    UInt32          s_trailIdx          = 0;        // the node she is heading for
+    DWORD           s_trailStart        = 0;
+    DWORD           s_trailLastTick     = 0;
+    UInt32          s_trailMoves        = 0;
+    DWORD           s_lastTrailCheck    = 0;
+    DWORD           s_lastTrailWhyLog   = 0;
     bool            s_planValid         = false;    // a ledge was found a moment ago and is not searched for again
     Parkour::Type   s_planType          = Parkour::kNoLedge;
     NiPoint3        s_planStart;
@@ -109,24 +124,24 @@ namespace
     bool            s_haveProbe         = false;
     NiPoint3        s_posBefore;
 
-    // The position correction: the same idea as the player's, with its own state
-    // so the two can never disturb each other.
+    // The position correction. The animation starts from an exact mark, and she
+    // is brought to it at running speed: the first logs showed a pull spread over
+    // thirty ticks looking like a slow slide, and the moves that began from the
+    // farthest marks were the ones that went wrong.
     struct Correction
     {
         bool    initialised;
         bool    done;
-        float   gap;
-        float   missing[4];
+        DWORD   last;
     };
 
-    Correction s_corr = { false, false, 0.0f, { 0.0f, 0.0f, 0.0f, 0.0f } };
+    Correction s_corr = { false, false, 0 };
 
     void ResetCorrection()
     {
         s_corr.initialised  = false;
         s_corr.done         = false;
-        s_corr.gap          = 0.0f;
-        memset(s_corr.missing, 0, sizeof(s_corr.missing));
+        s_corr.last         = 0;
     }
 
     // ---- small helpers ------------------------------------------------------
@@ -210,9 +225,6 @@ namespace
 
     // ---- the per-tick position correction -----------------------------------
 
-    // The animation starts from an exact mark. Rather than teleport the actor
-    // there, the remaining gap is walked off over the first ticks - the same
-    // approach, and the same numbers, as the player's (Parkour.cpp).
     void RunCorrection(Actor * npc)
     {
         void * ctrl = Engine::CharController(npc);
@@ -222,44 +234,43 @@ namespace
         Engine::ControllerGetPosition(ctrl, current, true);
 
         const float scale = Engine::HavokScale();
+        const float mx = s_start.x * scale - current[0];
+        const float my = s_start.y * scale - current[1];
+        const float mz = s_start.z * scale - current[2];
+        const float distance = sqrtf(mx * mx + my * my + mz * mz);
+
+        const DWORD now = GetTickCount();
+        float dt = 1.0f / 60.0f;
+        if(s_corr.initialised)
+            dt = (float)(now - s_corr.last) / 1000.0f;
+        if(dt > 0.1f) dt = 0.1f;
+        if(dt <= 0.0f) dt = 1.0f / 60.0f;
+        s_corr.last = now;
 
         if(!s_corr.initialised)
         {
-            s_corr.missing[0] = s_start.x * scale - current[0];
-            s_corr.missing[1] = s_start.y * scale - current[1];
-            s_corr.missing[2] = s_start.z * scale - current[2];
-            s_corr.missing[3] = 0.0f;
-
-            s_corr.gap = sqrtf(s_corr.missing[0] * s_corr.missing[0] +
-                               s_corr.missing[1] * s_corr.missing[1] +
-                               s_corr.missing[2] * s_corr.missing[2]);
             s_corr.initialised = true;
-
-            _MESSAGE("NPC test: start mark is %.1f game units away", s_corr.gap * Engine::HavokScaleInverse());
+            _MESSAGE("NPC test: start mark is %.1f game units away", distance / scale);
         }
 
-        if(s_corr.done || s_corr.gap <= 0.1f)
+        if(s_corr.done) return;
+
+        if(distance <= 2.0f * scale)
         {
             s_corr.done = true;
             return;
         }
 
-        float step = 1.0f / 30.0f;
-        const float timeScale = Engine::GlobalTimeMultiplier();
-        if(timeScale > 0.0f) step *= timeScale;
+        const float maxStep = s_dashSpeed * scale * dt;
+        const float k = (distance <= maxStep) ? 1.0f : maxStep / distance;
 
         __declspec(align(16)) float target[4];
-        target[0] = current[0] + s_corr.missing[0] * step;
-        target[1] = current[1] + s_corr.missing[1] * step;
-        target[2] = current[2] + s_corr.missing[2] * step;
+        target[0] = current[0] + mx * k;
+        target[1] = current[1] + my * k;
+        target[2] = current[2] + mz * k;
         target[3] = 0.0f;
 
         Engine::ControllerSetPosition(ctrl, target, true, false);
-
-        const float dx = s_corr.missing[0] * step;
-        const float dy = s_corr.missing[1] * step;
-        const float dz = s_corr.missing[2] * step;
-        s_corr.gap -= sqrtf(dx * dx + dy * dy + dz * dz);
     }
 
     // ---- ending a test ------------------------------------------------------
@@ -313,6 +324,7 @@ namespace
         s_npc       = NULL;
         s_requested = false;
         s_planValid = false;
+        s_trailRun  = false;
         ResetCorrection();
     }
 
@@ -591,6 +603,319 @@ namespace
 
     // ---- 5. watch -----------------------------------------------------------
 
+    // ---- step 3: the player's trail ----------------------------------------
+    //
+    // What the first logs showed: sending a follower to "find a ledge where she
+    // happens to be" gets her to climb the right thing only now and then, and
+    // the failures line up with her being a long way from the move's start mark.
+    // What the PLAYER did is a better guide, for a plain reason: it is known to
+    // work. The player stood on those spots, ran that path, climbed those ledges
+    // from those marks.
+    //
+    // So the player leaves a trail: a position every 400 ms or so while on the
+    // ground and at least a step from the last one, and, whenever FreeRun makes
+    // the player start a move, a node that carries the move itself - its type,
+    // its start mark, the way the player faced, and where it ended.
+    //
+    // A tracked follower who is well below the player and not getting closer
+    // joins the trail at the node nearest her and walks it: from position to
+    // position at running speed, and at each move node, standing on its start
+    // mark, she makes the same move. The trail is only followed if it is whole.
+    // A plain jump leaves a gap in it, and she cannot copy a plain jump.
+    //
+    // While she is on the trail her physics are off and this module moves her,
+    // so the AI cannot walk her somewhere else. Her own animation carries on as
+    // if she were running. Whether that looks right is for the game to say.
+
+    struct TrailNode
+    {
+        DWORD           time;
+        bool            isMove;         // a FreeRun move the player made
+        bool            hasEnd;         // its end position is known
+        Parkour::Type   type;           // moves only
+        float           yaw;            // moves only: the way the player faced
+        NiPoint3        pos;            // a position; for a move, its start mark
+        NiPoint3        end;            // moves only: where the player ended up
+    };
+
+    enum { kTrailMax = 300 };
+
+    TrailNode   s_trail[kTrailMax];
+    UInt32      s_trailCount        = 0;
+    DWORD       s_lastTrailSample   = 0;
+
+    void TrailAppend(const TrailNode & node)
+    {
+        if(s_trailCount >= (UInt32)kTrailMax)
+        {
+            memmove(&s_trail[0], &s_trail[1], sizeof(TrailNode) * (kTrailMax - 1));
+            s_trailCount = kTrailMax - 1;
+            if(s_trailRun && s_trailIdx > 0) --s_trailIdx;      // keep a running replay on the same node
+        }
+
+        s_trail[s_trailCount++] = node;
+
+        if(s_trailCount % 50 == 0)
+            _MESSAGE("NPC trail: %u nodes", (unsigned int)s_trailCount);
+    }
+
+    TrailNode MakeWalkNode(const NiPoint3 & pos, DWORD now)
+    {
+        TrailNode node;
+        node.time   = now;
+        node.isMove = false;
+        node.hasEnd = false;
+        node.type   = Parkour::kNoLedge;
+        node.yaw    = 0.0f;
+        node.pos    = pos;
+        node.end    = pos;
+        return node;
+    }
+
+    NiPoint3 TrailExit(const TrailNode & node)
+    {
+        return (node.isMove && node.hasEnd) ? node.end : node.pos;
+    }
+
+    // Can a body go from the end of one node to the start of the next on foot?
+    bool TrailSegmentOk(const TrailNode & a, const TrailNode & b)
+    {
+        const NiPoint3 from = TrailExit(a);
+        const float dx = b.pos.x - from.x;
+        const float dy = b.pos.y - from.y;
+        const float dz = fabsf(b.pos.z - from.z);
+        return sqrtf(dx * dx + dy * dy) <= 350.0f && dz <= 90.0f;
+    }
+
+    // Called every tick: it is one comparison except when a sample is due.
+    void TrailSample(Actor * player)
+    {
+        if(!s_enabled || !s_trailEnabled) return;
+
+        const DWORD now = GetTickCount();
+        if(now - s_lastTrailSample < 400) return;
+        s_lastTrailSample = now;
+
+        if(Parkour::InProgress()) return;               // a move writes itself
+        if(Parkour::IsSwimming(player)) return;
+        if(Engine::PlayerIsInMidair()) return;          // only places a body has stood on
+
+        const NiPoint3 pos = Engine::Position(player);
+
+        if(s_trailCount > 0)
+        {
+            const NiPoint3 from = TrailExit(s_trail[s_trailCount - 1]);
+            const float dx = pos.x - from.x;
+            const float dy = pos.y - from.y;
+            const float dz = pos.z - from.z;
+
+            if(sqrtf(dx * dx + dy * dy) > 3000.0f)      // fast travel, a teleport, somewhere new
+            {
+                _MESSAGE("NPC trail: the player moved %.0f units at once: the trail starts over", sqrtf(dx * dx + dy * dy));
+                s_trailCount = 0;
+            }
+            else if(sqrtf(dx * dx + dy * dy + dz * dz) < s_trailSpacing)
+            {
+                return;
+            }
+        }
+
+        TrailAppend(MakeWalkNode(pos, now));
+    }
+
+    // The node nearest her, if the trail from there to the player is whole.
+    bool FindTrailEntry(const NiPoint3 & pos, UInt32 & entry, float & distance, const char *& why)
+    {
+        float best = 1.0e9f;
+        UInt32 bestIndex = 0;
+
+        for(UInt32 i = 0; i < s_trailCount; ++i)
+        {
+            const float dx = pos.x - s_trail[i].pos.x;
+            const float dy = pos.y - s_trail[i].pos.y;
+            const float dz = pos.z - s_trail[i].pos.z;
+            const float d = sqrtf(dx * dx + dy * dy + dz * dz);
+            if(d < best) { best = d; bestIndex = i; }
+        }
+
+        if(best > s_trailJoinRadius)
+        {
+            why = "no point of the player's path is within her reach";
+            return false;
+        }
+
+        for(UInt32 i = bestIndex; i + 1 < s_trailCount; ++i)
+        {
+            if(!TrailSegmentOk(s_trail[i], s_trail[i + 1]))
+            {
+                why = "the player's path has a gap from there on (a plain jump or a fall)";
+                return false;
+            }
+        }
+
+        entry    = bestIndex;
+        distance = best;
+        return true;
+    }
+
+    void StartTrail(Actor * npc, UInt32 entry, float entryDistance, float heightGap, float distance)
+    {
+        const DWORD now = GetTickCount();
+
+        UInt32 moves = 0;
+        for(UInt32 i = entry; i < s_trailCount; ++i)
+            if(s_trail[i].isMove) ++moves;
+
+        _MESSAGE("NPC track %08X: the player is %.0f above her, %.0f away, and she is not getting closer: "
+                 "following his path from node %u of %u (%.0f units from her), %u moves ahead",
+                 (unsigned int)s_trackedId, heightGap, distance, (unsigned int)entry,
+                 (unsigned int)s_trailCount, entryDistance, (unsigned int)moves);
+
+        s_manual        = false;
+        s_npc           = npc;
+        s_state         = kTrail;
+        s_planValid     = false;
+        s_trailRun      = true;
+        s_trailIdx      = entry;
+        s_trailStart    = now;
+        s_trailLastTick = now;
+        s_trailMoves    = 0;
+
+        void * ctrl = Engine::CharController(npc);
+        if(ctrl)
+            Engine::ControllerFlags(ctrl) |= Engine::Controller::kFlag_NoSim;
+    }
+
+    void TrailEnd(Actor * npc, const char * why, bool release)
+    {
+        _MESSAGE("NPC trail: %s after %lu ms, %u moves repeated",
+                 why, (unsigned long)(GetTickCount() - s_trailStart), (unsigned int)s_trailMoves);
+
+        if(release && npc)
+            ReleaseNpc(npc, false);
+
+        s_trailRun      = false;
+        s_state         = kIdle;
+        s_npc           = NULL;
+        s_planValid     = false;
+        s_cooldownUntil = GetTickCount() + (DWORD)(s_autoCooldownSec * 1000.0f);
+        s_anchorReset   = true;
+        ResetCorrection();
+    }
+
+    // One step toward `target` (game coordinates) at `speed` game units a second.
+    // Returns how far is left after the step.
+    float TrailMoveToward(Actor * npc, void * ctrl, const NiPoint3 & target, float dt, float speed)
+    {
+        __declspec(align(16)) float current[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        Engine::ControllerGetPosition(ctrl, current, true);
+
+        const float scale = Engine::HavokScale();
+        const float mx = target.x * scale - current[0];
+        const float my = target.y * scale - current[1];
+        const float mz = target.z * scale - current[2];
+        const float distance = sqrtf(mx * mx + my * my + mz * mz);
+        if(distance < 0.0001f) return 0.0f;
+
+        const float left = distance / scale;                    // game units
+        const float stepGame = speed * dt;
+        const float k = (left <= stepGame) ? 1.0f : stepGame / left;
+
+        __declspec(align(16)) float next[4];
+        next[0] = current[0] + mx * k;
+        next[1] = current[1] + my * k;
+        next[2] = current[2] + mz * k;
+        next[3] = 0.0f;
+        Engine::ControllerSetPosition(ctrl, next, true, false);
+
+        if(fabsf(mx) + fabsf(my) > 2.0f * scale)                // face where she is going
+            Engine::Rotation(npc).z = atan2f(mx, my);
+
+        return (left <= stepGame) ? 0.0f : left - stepGame;
+    }
+
+    void TrailStep(Actor * npc, DWORD now)
+    {
+        Actor * player = (Actor *)Engine::Player();
+        if(!player)
+        {
+            TrailEnd(npc, "there is no player", true);
+            return;
+        }
+
+        if(now - s_trailStart > (DWORD)(s_trailMaxSec * 1000.0f))
+        {
+            TrailEnd(npc, "took too long, stopped", true);
+            return;
+        }
+
+        if(Parkour::IsKnockedOut(npc) || Parkour::IsStaggering(npc))
+        {
+            TrailEnd(npc, "she was knocked down, stopped", true);
+            return;
+        }
+
+        if(Parkour::IsWeaponOut(npc))
+        {
+            TrailEnd(npc, "she drew her weapon: a fight is left to the AI", true);
+            return;
+        }
+
+        void * ctrl = Engine::CharController(npc);
+        if(!ctrl)
+        {
+            TrailEnd(npc, "she has no character controller", false);
+            return;
+        }
+
+        float dt = (float)(now - s_trailLastTick) / 1000.0f;
+        s_trailLastTick = now;
+        if(dt > 0.1f) dt = 0.1f;
+        if(dt <= 0.0f) return;
+
+        // Done when she is level with the player and close.
+        const NiPoint3 here  = Engine::Position(npc);
+        const NiPoint3 there = Engine::Position(player);
+        const float px = there.x - here.x;
+        const float py = there.y - here.y;
+        if(sqrtf(px * px + py * py) <= s_trailEndRadius && fabsf(there.z - here.z) <= 100.0f)
+        {
+            TrailEnd(npc, "she caught up with the player", true);
+            return;
+        }
+
+        if(s_trailIdx >= s_trailCount)
+        {
+            TrailEnd(npc, "the end of the player's path", true);
+            return;
+        }
+
+        const TrailNode node = s_trail[s_trailIdx];
+        const float left = TrailMoveToward(npc, ctrl, node.pos, dt, s_trailSpeed);
+
+        if(!node.isMove)
+        {
+            if(left <= 15.0f) ++s_trailIdx;
+            return;
+        }
+
+        // A move is made from its start mark and nowhere else.
+        if(left <= 8.0f)
+        {
+            ++s_trailMoves;
+            _MESSAGE("NPC trail: at the start mark of the player's %s (node %u): repeating it",
+                     TypeName(node.type), (unsigned int)s_trailIdx);
+
+            s_planValid     = true;
+            s_planType      = node.type;
+            s_planStart     = node.pos;
+            Engine::Rotation(npc).z = node.yaw;
+            s_state         = kAligning;
+            s_stateStart    = now - (kAlignMs - kPlanSettleMs);
+            // s_trailIdx moves on when the move ends (Succeed)
+        }
+    }
+
     void Succeed(Actor * npc, DWORD now)
     {
         const NiPoint3 after = Engine::Position(npc);
@@ -598,6 +923,17 @@ namespace
 
         _MESSAGE("NPC test: finished after %lu ms, moved from (%.0f, %.0f, %.0f) to (%.0f, %.0f, %.0f)",
                  (unsigned long)took, s_posBefore.x, s_posBefore.y, s_posBefore.z, after.x, after.y, after.z);
+
+        // On the trail she is not handed back yet: the next node is waiting.
+        if(s_trailRun)
+        {
+            ++s_trailIdx;
+            s_state         = kTrail;
+            s_trailLastTick = now;
+            s_planValid     = false;
+            ResetCorrection();
+            return;
+        }
 
         const float rise = after.z - s_posBefore.z;
         const Parkour::Type type = s_type;
@@ -631,6 +967,10 @@ namespace
             case kAligning:
                 if(now - s_stateStart >= kAlignMs)
                     ProbeAndStart();
+                return;
+
+            case kTrail:
+                TrailStep(npc, now);
                 return;
 
             case kWaitStart:
@@ -895,6 +1235,42 @@ namespace
         const bool canAct       = NpcCanAct(npc, why, true);
         const bool canLook      = canAct;
 
+        // ---- the player's trail: the way he went up -------------------------
+        //
+        // The player is well above her and she is not getting closer, or is
+        // running on the spot: if his path from where she is to where he is
+        // can be walked, she walks it, and makes the moves he made.
+        const float heightGap = playerPos.z - pos.z;
+        const bool trouble = wantsToMove && ((haveWindow && approach < s_autoMinApproach) || stillFor >= s_autoStuckSec);
+
+        if(s_autoTracked && s_trailEnabled && trouble && heightGap >= s_trailMinHeight &&
+           distance <= s_autoMaxDistance && s_trailCount >= 3 && now >= s_cooldownUntil &&
+           now - s_lastTrailCheck >= 500)
+        {
+            s_lastTrailCheck = now;
+
+            if(canAct && !Parkour::IsWeaponOut(npc) && !Parkour::InProgress() && !Parkour::MenuOpen())
+            {
+                UInt32 entry = 0;
+                float entryDistance = 0.0f;
+                const char * noTrail = NULL;
+
+                if(FindTrailEntry(pos, entry, entryDistance, noTrail))
+                {
+                    StartTrail(npc, entry, entryDistance, heightGap, distance);
+                    return;
+                }
+
+                if(now - s_lastTrailWhyLog >= 3000)
+                {
+                    s_lastTrailWhyLog = now;
+                    _MESSAGE("NPC track %08X: the player is %.0f above her and she is not getting closer, "
+                             "but there is no trail to follow: %s",
+                             (unsigned int)s_trackedId, heightGap, noTrail ? noTrail : "?");
+                }
+            }
+        }
+
         // The ledge search is the expensive part: twice a second at most, and only
         // while she is in trouble.
         bool probedNow = false;
@@ -1017,6 +1393,8 @@ namespace
 
     void TickInner(Actor * player)
     {
+        TrailSample(player);
+
         if(s_state == kIdle)
         {
             if(s_requested)
@@ -1069,6 +1447,19 @@ namespace NpcParkour
         s_autoDetourSec     = ReadFloat("fAutoDetourSec", s_autoDetourSec);
         s_autoMinApproach   = ReadFloat("fAutoMinApproach", s_autoMinApproach);
         s_autoMaxStartGap   = ReadFloat("fAutoMaxStartGap", s_autoMaxStartGap);
+        s_dashSpeed         = ReadFloat("fDashSpeed", s_dashSpeed);
+        s_trailEnabled      = GetPrivateProfileIntA(kSection, "bTrail", s_trailEnabled ? 1 : 0, kIni) != 0;
+        s_trailMinHeight    = ReadFloat("fTrailMinHeight", s_trailMinHeight);
+        s_trailJoinRadius   = ReadFloat("fTrailJoinRadius", s_trailJoinRadius);
+        s_trailSpeed        = ReadFloat("fTrailSpeed", s_trailSpeed);
+        s_trailEndRadius    = ReadFloat("fTrailEndRadius", s_trailEndRadius);
+        s_trailMaxSec       = ReadFloat("fTrailMaxSec", s_trailMaxSec);
+        s_trailSpacing      = ReadFloat("fTrailSpacing", s_trailSpacing);
+        if(s_dashSpeed < 100.0f)        s_dashSpeed = 100.0f;
+        if(s_trailSpeed < 100.0f)       s_trailSpeed = 100.0f;
+        if(s_trailSpeed > 700.0f)       s_trailSpeed = 700.0f;
+        if(s_trailSpacing < 20.0f)      s_trailSpacing = 20.0f;
+        if(s_trailSpacing > 120.0f)     s_trailSpacing = 120.0f;
         s_manualToward      = GetPrivateProfileIntA(kSection, "bManualTowardPlayer", s_manualToward ? 1 : 0, kIni) != 0;
         s_manualMaxGap      = ReadFloat("fManualMaxStartGap", s_manualMaxGap);
         if(s_autoDetourSec < 1.0f)      s_autoDetourSec = 1.0f;
@@ -1097,6 +1488,38 @@ namespace NpcParkour
 
         s_requested     = true;
         s_requestedAt   = GetTickCount();
+    }
+
+    void RecordPlayerMove(int type, const NiPoint3 & startMark, const NiPoint3 & facing)
+    {
+        if(!s_enabled || !s_trailEnabled) return;
+
+        // A grab is made in the air after a jump, and she cannot copy a jump.
+        if(type == Parkour::kNoLedge || type == Parkour::kFailed || type == Parkour::kGrab) return;
+
+        TrailNode node = MakeWalkNode(startMark, GetTickCount());
+        node.isMove = true;
+        node.type   = (Parkour::Type)type;
+        node.yaw    = atan2f(facing.x, facing.y);
+
+        TrailAppend(node);
+
+        _MESSAGE("NPC trail: recorded the player's %s from (%.0f, %.0f, %.0f), heading %.2f (%u nodes)",
+                 TypeName((Parkour::Type)type), startMark.x, startMark.y, startMark.z, node.yaw, (unsigned int)s_trailCount);
+    }
+
+    void RecordPlayerMoveEnd(const NiPoint3 & endPosition)
+    {
+        if(!s_enabled || !s_trailEnabled || s_trailCount == 0) return;
+
+        TrailNode & last = s_trail[s_trailCount - 1];
+        if(!last.isMove || last.hasEnd) return;
+
+        last.end    = endPosition;
+        last.hasEnd = true;
+
+        // The walk carries on from where the move ended.
+        TrailAppend(MakeWalkNode(endPosition, GetTickCount()));
     }
 
     void RequestTrack()
@@ -1145,6 +1568,7 @@ namespace NpcParkour
         s_requested = false;
         s_npc       = NULL;
         s_planValid   = false;
+        s_trailRun    = false;
         s_anchorReset = true;                   // the tracked NPC, if any, is kept
         ResetCorrection();
     }
@@ -1158,5 +1582,6 @@ namespace NpcParkour
             _MESSAGE("NPC track: %08X forgotten (a load or a new game)", (unsigned int)s_trackedId);
         s_tracked   = NULL;
         s_trackedId = 0;
+        s_trailCount = 0;                       // the old world's trail means nothing in the new one
     }
 }
