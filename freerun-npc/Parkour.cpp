@@ -817,9 +817,9 @@ namespace Parkour
 
 		if(stop)
 		{
-			// NPC TEST BUILD: where the move ended, for the trail.
+			// NPC TEST BUILD: the landing on top of the edge, and where the move ended, for the trail.
 			if(s_inProgress)
-				NpcParkour::RecordPlayerMoveEnd(Engine::Position(player));
+				NpcParkour::RecordPlayerMoveEnd(player);
 
 			if(ctrl)
 				Engine::ControllerFlags(ctrl) &= ~Engine::Controller::kFlag_NoSim;
@@ -902,7 +902,7 @@ namespace Parkour
 			s_startPos = StartingPosition(player, type, start) ? start : Engine::Position(player);
 
 			// NPC TEST BUILD: the trail a follower can repeat.
-			NpcParkour::RecordPlayerMove((int)type, s_startPos, FacingFlat(player));
+			NpcParkour::RecordPlayerMove((int)type, s_startPos, s_ledgePoint, FacingFlat(player));
 
 			// A step taken with the weapon drawn only plays on the legs, so the
 			// player keeps their guard up.

@@ -37,8 +37,8 @@ namespace NpcParkour
 
     // Called by Parkour.cpp when FreeRun starts and ends one of the PLAYER's moves,
     // so that a follower can repeat it later (the player's trail, step 3).
-    void    RecordPlayerMove(int type, const NiPoint3 & startMark, const NiPoint3 & facing);
-    void    RecordPlayerMoveEnd(const NiPoint3 & endPosition);
+    void    RecordPlayerMove(int type, const NiPoint3 & startMark, const NiPoint3 & ledge, const NiPoint3 & facing);
+    void    RecordPlayerMoveEnd(Actor * player);
     void    Reset();                    // graph rebuilt: forget the running move (the tracked NPC is kept)
     void    Forget();                   // a load or a new game: forget the running move AND the tracked NPC
 }

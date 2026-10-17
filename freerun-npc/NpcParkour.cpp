@@ -72,6 +72,12 @@ namespace
     float   s_trailSpacing      = 40.0f;    // a trail node every this many units
     bool    s_trailWalk         = false;    // true: she also WALKS the player's path (experimental); false: she only repeats his moves
     float   s_trailMoveRadius   = 120.0f;   // she repeats a move of the player's when she is this close to its start mark
+    bool    s_callEnabled       = true;     // the player's move is the trigger: she goes to the same spot and does it too
+    float   s_callRadius        = 500.0f;   // she answers a move from this far (flat) from where it was made
+    float   s_callWindowSec     = 10.0f;    // ... for this long after he made it
+    int     s_callAttempts      = 3;        // tries at one move if she does not end up on top
+    bool    s_landing           = true;     // after a climb, rest the body on top of the edge
+    float   s_landingForward    = 38.0f;    // ... this far past it
     bool    s_manualToward      = true;     // F10: try the ledge between her and the player, from where she stands
     float   s_manualMaxGap      = 150.0f;   // F10: how far from the start mark she may be
 
@@ -106,6 +112,17 @@ namespace
     DWORD           s_trackRequestedAt  = 0;
     bool            s_manual            = true;     // the running move came from the key
     bool            s_trailRun          = false;    // a trail replay is running
+    bool            s_trailCall         = false;    // ... and it answers a move of the player's
+    DWORD           s_callNodeTime      = 0;        // the move being answered (by its time)
+    DWORD           s_callAfterTime     = 0;        // moves made at or before this are answered
+    UInt32          s_callAttemptsMade  = 0;
+    DWORD           s_lastCallCheck     = 0;
+    DWORD           s_lastCallWhyLog    = 0;
+    DWORD           s_lastPathCheck     = 0;
+    NiPoint3        s_planLedge;                    // the top of the edge of the move being made
+    int             s_playerMoveType    = -1;       // the player's own last move, for his landing
+    NiPoint3        s_playerMoveLedge;
+    float           s_playerMoveYaw     = 0.0f;
     UInt32          s_trailIdx          = 0;        // the node she is heading for
     DWORD           s_trailStart        = 0;
     DWORD           s_trailLastTick     = 0;
@@ -346,6 +363,7 @@ namespace
         s_requested = false;
         s_planValid = false;
         s_trailRun  = false;
+        s_trailCall = false;
         ResetCorrection();
     }
 
@@ -422,8 +440,9 @@ namespace
     // Her physics are switched off at once, so that she cannot run on while the
     // turn settles; the first ticks of the move walk her to the start mark, and
     // ReleaseNpc gives her physics back when it ends.
-    void StartOn(Actor * npc, bool turn, float yaw, bool manual, Parkour::Type type, const NiPoint3 & start)
+    void StartOn(Actor * npc, bool turn, float yaw, bool manual, Parkour::Type type, const NiPoint3 & start, const NiPoint3 & ledge)
     {
+        s_planLedge = ledge;
         s_manual    = manual;
         s_npc       = npc;
         s_state     = kAligning;
@@ -524,7 +543,7 @@ namespace
                 return;
             }
 
-            StartOn(npc, true, atan2f(tx, ty), true, type, start);
+            StartOn(npc, true, atan2f(tx, ty), true, type, start, ledge);
             return;
         }
 
@@ -578,6 +597,7 @@ namespace
 
             float scale = 1.0f;
             const bool ok = Parkour::ProbeForActor(npc, type, ledge, start, scale);
+            s_planLedge = ledge;
             _MESSAGE("NPC test: ledge search says %s (%d), actor scale %.2f", TypeName(type), (int)type, scale);
 
             if(!ok || type == Parkour::kNoLedge)
@@ -657,6 +677,7 @@ namespace
         float           yaw;            // moves only: the way the player faced
         NiPoint3        pos;            // a position; for a move, its start mark
         NiPoint3        end;            // moves only: where the player ended up
+        NiPoint3        ledge;          // moves only: the top of the edge he climbed
     };
 
     enum { kTrailMax = 300 };
@@ -690,6 +711,7 @@ namespace
         node.yaw    = 0.0f;
         node.pos    = pos;
         node.end    = pos;
+        node.ledge  = pos;
         return node;
     }
 
@@ -869,6 +891,8 @@ namespace
         s_state         = kTrail;
         s_planValid     = false;
         s_trailRun      = true;
+        s_trailCall     = false;
+        s_callAttemptsMade = 0;
         s_trailIdx      = entry;
         s_trailStart    = now;
         s_trailLastTick = now;
@@ -888,6 +912,7 @@ namespace
             ReleaseNpc(npc, false);
 
         s_trailRun      = false;
+        s_trailCall     = false;
         s_state         = kIdle;
         s_npc           = NULL;
         s_planValid     = false;
@@ -967,6 +992,153 @@ namespace
         return (left <= stepGame) ? 0.0f : left - stepGame;
     }
 
+    // ---- step 4: landing, and answering the player's moves -------------------
+
+    bool IsClimbType(int type)
+    {
+        return type == Parkour::kLow || type == Parkour::kMedium ||
+               type == Parkour::kHigh || type == Parkour::kHighest;
+    }
+
+    // Puts someone who has just finished a climb ON the surface: a step past the
+    // edge, on the ground there. The animation ends at the lip, and a body left at
+    // the lip tends to slide back down - which is what the player sees, and what
+    // made the follower give up and take the long way round instead of trying
+    // again. The spot is checked before anyone is moved: there has to be ground
+    // there at the height of the edge, the way to it has to be free of anything
+    // solid, and it has to be close to where the body already is.
+    bool ApplyLanding(Actor * who, const NiPoint3 & ledge, float yaw)
+    {
+        if(!s_landing || !who) return false;
+
+        void * ctrl = Engine::CharController(who);
+        if(!ctrl) return false;
+
+        const NiPoint3 here = Engine::Position(who);
+        if(here.z < ledge.z - 50.0f) return false;              // not up yet: a move that was interrupted
+
+        const float fx = sinf(yaw);
+        const float fy = cosf(yaw);
+        const float tries[2] = { s_landingForward, s_landingForward * 0.5f };
+
+        for(int t = 0; t < 2; ++t)
+        {
+            const float lx = ledge.x + fx * tries[t];
+            const float ly = ledge.y + fy * tries[t];
+
+            float groundZ = 0.0f;
+            if(!GroundAt(who, lx, ly, ledge.z, groundZ)) continue;
+            if(fabsf(groundZ - ledge.z) > 40.0f) continue;      // not the same surface
+
+            const NiPoint3 landing(lx, ly, groundZ + 1.0f);
+
+            const float dx = landing.x - here.x;
+            const float dy = landing.y - here.y;
+            const float dz = landing.z - here.z;
+            const float moveBy = sqrtf(dx * dx + dy * dy + dz * dz);
+
+            if(moveBy > 140.0f) continue;                       // nowhere near where it should be
+            if(moveBy < 4.0f) return true;                      // already there
+            if(!PathClear(who, here, landing)) continue;        // something solid in the way
+
+            const float scale = Engine::HavokScale();
+            __declspec(align(16)) float target[4];
+            target[0] = landing.x * scale;
+            target[1] = landing.y * scale;
+            target[2] = landing.z * scale;
+            target[3] = 0.0f;
+            Engine::ControllerSetPosition(ctrl, target, true, false);
+
+            __declspec(align(16)) float stopped[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            Engine::ControllerSetLinearVelocity(ctrl, stopped);
+
+            _MESSAGE("NPC landing: moved %.0f units to rest on top of the edge (%.0f past it)", moveBy, tries[t]);
+            return true;
+        }
+
+        _MESSAGE("NPC landing: no safe spot past the edge: left where the animation ended");
+        return false;
+    }
+
+    // The first of the player's moves that is still waiting for an answer, if she
+    // can answer it. Moves are answered in the order he made them. A move she has
+    // already got past, or that would not lift her, counts as answered.
+    bool FindCall(Actor * npc, const NiPoint3 & pos, DWORD now, UInt32 & index, float & markDistance, const char *& why)
+    {
+        why = NULL;
+
+        for(UInt32 i = 0; i < s_trailCount; ++i)
+        {
+            const TrailNode & node = s_trail[i];
+            if(!node.isMove) continue;
+            if(node.time <= s_callAfterTime) continue;                          // answered
+            if(now - node.time > (DWORD)(s_callWindowSec * 1000.0f)) continue;  // too long ago
+            if(node.type == Parkour::kStepLow || node.type == Parkour::kStepHigh) continue;     // she steps up by herself
+
+            const float dx = pos.x - node.pos.x;
+            const float dy = pos.y - node.pos.y;
+            const float horizontal = sqrtf(dx * dx + dy * dy);
+
+            // Already past the point he made the move from, along the way he went.
+            const float along = dx * sinf(node.yaw) + dy * cosf(node.yaw);
+            if(along > 60.0f) { s_callAfterTime = node.time; continue; }
+
+            // Already as high as that climb took him.
+            if(IsClimbType(node.type) && node.hasEnd && node.end.z - pos.z < 40.0f)
+            {
+                s_callAfterTime = node.time;
+                continue;
+            }
+
+            if(horizontal > s_callRadius)
+            {
+                why = "she is too far from where the player made his move";
+                return false;
+            }
+
+            if(!PathClear(npc, pos, node.pos))
+            {
+                why = "something solid is between her and the place he made it";
+                return false;
+            }
+
+            index           = i;
+            markDistance    = horizontal;
+            return true;
+        }
+
+        return false;
+    }
+
+    void StartCall(Actor * npc, UInt32 index, float markDistance, float playerDistance)
+    {
+        const DWORD now = GetTickCount();
+        const TrailNode & node = s_trail[index];
+
+        _MESSAGE("NPC track %08X: the player made a %s %.1f s ago, %.0f units from her (%.0f from him): "
+                 "she goes to the same spot and does it too",
+                 (unsigned int)s_trackedId, TypeName(node.type), (float)(now - node.time) / 1000.0f,
+                 markDistance, playerDistance);
+
+        s_manual            = false;
+        s_npc               = npc;
+        s_state             = kTrail;
+        s_planValid         = false;
+        s_trailRun          = true;
+        s_trailCall         = true;
+        s_trailIdx          = index;
+        s_callNodeTime      = node.time;
+        s_callAttemptsMade  = 0;
+        s_trailStart        = now;
+        s_trailLastTick     = now;
+        s_lastPathCheck     = now;
+        s_trailMoves        = 0;
+
+        void * ctrl = Engine::CharController(npc);
+        if(ctrl)
+            Engine::ControllerFlags(ctrl) |= Engine::Controller::kFlag_NoSim;
+    }
+
     void TrailStep(Actor * npc, DWORD now)
     {
         Actor * player = (Actor *)Engine::Player();
@@ -976,7 +1148,7 @@ namespace
             return;
         }
 
-        if(now - s_trailStart > (DWORD)(s_trailMaxSec * 1000.0f))
+        if(now - s_trailStart > (DWORD)((s_trailCall ? 25.0f : s_trailMaxSec) * 1000.0f))
         {
             TrailEnd(npc, "took too long, stopped", true);
             return;
@@ -1011,7 +1183,8 @@ namespace
         const NiPoint3 there = Engine::Position(player);
         const float px = there.x - here.x;
         const float py = there.y - here.y;
-        if(sqrtf(px * px + py * py) <= s_trailEndRadius && fabsf(there.z - here.z) <= 100.0f)
+        // (Not when answering a move: next to a fence, level with him, she still has to vault it.)
+        if(!s_trailCall && sqrtf(px * px + py * py) <= s_trailEndRadius && fabsf(there.z - here.z) <= 100.0f)
         {
             TrailEnd(npc, "she caught up with the player", true);
             return;
@@ -1024,7 +1197,23 @@ namespace
         }
 
         const TrailNode node = s_trail[s_trailIdx];
-        const float left = TrailMoveToward(npc, ctrl, node.pos, dt, s_trailWalk ? s_trailSpeed : s_dashSpeed, s_trailWalk && !node.isMove);
+
+        // Answering a move she may have a way to go to its start mark, on foot: the
+        // way is checked again every so often, and she is kept on the ground.
+        if(s_trailCall && now - s_lastPathCheck >= 400)
+        {
+            s_lastPathCheck = now;
+            if(!PathClear(npc, here, node.pos))
+            {
+                s_callAfterTime = s_callNodeTime;
+                TrailEnd(npc, "the way to the start mark is blocked", true);
+                return;
+            }
+        }
+
+        const bool onFoot = s_trailCall || s_trailWalk;
+        const float left = TrailMoveToward(npc, ctrl, node.pos, dt, onFoot ? s_trailSpeed : s_dashSpeed,
+                                           s_trailCall || (s_trailWalk && !node.isMove));
 
         if(!node.isMove)
         {
@@ -1042,6 +1231,7 @@ namespace
             s_planValid     = true;
             s_planType      = node.type;
             s_planStart     = node.pos;
+            s_planLedge     = node.ledge;
             Engine::Rotation(npc).z = node.yaw;
             s_state         = kAligning;
             s_stateStart    = now - (kAlignMs - kPlanSettleMs);
@@ -1057,13 +1247,45 @@ namespace
         _MESSAGE("NPC test: finished after %lu ms, moved from (%.0f, %.0f, %.0f) to (%.0f, %.0f, %.0f)",
                  (unsigned long)took, s_posBefore.x, s_posBefore.y, s_posBefore.z, after.x, after.y, after.z);
 
-        // On the trail she is not handed back yet: the next node is waiting.
+        // The animation ends at the lip of the edge: rest her on top of it.
+        if(s_landing && IsClimbType(s_type))
+            ApplyLanding(npc, s_planLedge, Engine::Rotation(npc).z);
+
         if(s_trailRun && !s_trailWalk)
         {
+            // Did she end up on top? If not, she goes back to the start mark and
+            // tries again instead of being left to the AI, which sends her the
+            // long way round.
+            bool good = true;
+            if(IsClimbType(s_type))
+            {
+                const NiPoint3 final = Engine::Position(npc);
+                if(s_planLedge.x != 0.0f || s_planLedge.y != 0.0f)
+                    good = final.z >= s_planLedge.z - 30.0f;
+                else
+                    good = (final.z - s_posBefore.z) >= 60.0f;
+            }
+
+            if(!good && (int)s_callAttemptsMade + 1 < s_callAttempts)
+            {
+                ++s_callAttemptsMade;
+                _MESSAGE("NPC trail: she did not end up on top: back to the start mark to try again (attempt %u of %d)",
+                         (unsigned int)(s_callAttemptsMade + 1), s_callAttempts);
+                s_state         = kTrail;
+                s_planValid     = false;
+                s_trailLastTick = now;
+                ResetCorrection();
+                return;
+            }
+
             // One move repeated is the whole job. The AI takes her from here, and
-            // the next foot of a wall gets its own entry, after a short pause.
-            TrailEnd(npc, "repeated the player's move", true);
-            s_cooldownUntil = GetTickCount() + 2000;
+            // the next move of the player's gets its own entry, after a short pause.
+            const bool answered = s_trailCall;
+            if(answered)
+                s_callAfterTime = s_callNodeTime;
+
+            TrailEnd(npc, good ? "repeated the player's move" : "gave up on the player's move after trying", true);
+            s_cooldownUntil = GetTickCount() + (answered ? 500 : 2000);
             return;
         }
 
@@ -1377,6 +1599,33 @@ namespace
         const bool canAct       = NpcCanAct(npc, why, true);
         const bool canLook      = canAct;
 
+        // ---- the player's move: she answers it ------------------------------
+        //
+        // He climbed or vaulted something. If she is behind him and close enough,
+        // she goes to the same spot and does the same, instead of walking round.
+        if(s_autoTracked && s_trailEnabled && s_callEnabled && canAct && !Parkour::IsWeaponOut(npc) &&
+           !Parkour::MenuOpen() && now >= s_cooldownUntil && now - s_lastCallCheck >= 200)
+        {
+            s_lastCallCheck = now;
+
+            UInt32 callIndex = 0;
+            float markDistance = 0.0f;
+            const char * noCall = NULL;
+
+            if(FindCall(npc, pos, now, callIndex, markDistance, noCall))
+            {
+                StartCall(npc, callIndex, markDistance, distance);
+                return;
+            }
+
+            if(noCall && now - s_lastCallWhyLog >= 2000)
+            {
+                s_lastCallWhyLog = now;
+                _MESSAGE("NPC track %08X: the player made a move but she does not answer it: %s",
+                         (unsigned int)s_trackedId, noCall);
+            }
+        }
+
         // ---- the player's trail: the way he went up -------------------------
         //
         // The player is well above her and she is not getting closer, or is
@@ -1475,18 +1724,19 @@ namespace
         Parkour::Type chosen = Parkour::kNoLedge;
         float chosenGap = 0.0f, chosenLedgeZ = 0.0f;
         NiPoint3 chosenStart(0.0f, 0.0f, 0.0f);
+        NiPoint3 chosenLedge(0.0f, 0.0f, 0.0f);
         bool turn = false;
         const char * source = "";
 
         if(typeToward != Parkour::kNoLedge && typeToward != Parkour::kFailed)
         {
-            chosen = typeToward; chosenGap = towardGap; chosenLedgeZ = ledgeToward.z; chosenStart = startToward;
+            chosen = typeToward; chosenGap = towardGap; chosenLedgeZ = ledgeToward.z; chosenStart = startToward; chosenLedge = ledgeToward;
             turn = true; source = "toward the player";
         }
         else if(typeOwn != Parkour::kNoLedge && typeOwn != Parkour::kFailed && dot > 0.0f)
         {
             const float gx = startOwn.x - pos.x, gy = startOwn.y - pos.y, gz = startOwn.z - pos.z;
-            chosen = typeOwn; chosenGap = sqrtf(gx * gx + gy * gy + gz * gz); chosenLedgeZ = ledgeOwn.z; chosenStart = startOwn;
+            chosen = typeOwn; chosenGap = sqrtf(gx * gx + gy * gy + gz * gz); chosenLedgeZ = ledgeOwn.z; chosenStart = startOwn; chosenLedge = ledgeOwn;
             turn = false; source = "the way she faces";
         }
 
@@ -1514,7 +1764,7 @@ namespace
         _MESSAGE("NPC track %08X: %s, %.0f units from the player: starting the move on its own",
                  (unsigned int)s_trackedId, detour ? "running round it" : "pushing against it", distance);
 
-        StartOn(npc, turn, atan2f(tx, ty), false, chosen, chosenStart);
+        StartOn(npc, turn, atan2f(tx, ty), false, chosen, chosenStart, chosenLedge);
     }
 
     // The access violation caught, so that whatever is wrong with a pointer
@@ -1598,6 +1848,20 @@ namespace NpcParkour
         s_trailMaxSec       = ReadFloat("fTrailMaxSec", s_trailMaxSec);
         s_trailSpacing      = ReadFloat("fTrailSpacing", s_trailSpacing);
         s_trailWalk         = GetPrivateProfileIntA(kSection, "bTrailWalk", s_trailWalk ? 1 : 0, kIni) != 0;
+        s_callEnabled       = GetPrivateProfileIntA(kSection, "bTrailCall", s_callEnabled ? 1 : 0, kIni) != 0;
+        s_callRadius        = ReadFloat("fCallRadius", s_callRadius);
+        s_callWindowSec     = ReadFloat("fCallWindowSec", s_callWindowSec);
+        s_callAttempts      = GetPrivateProfileIntA(kSection, "iCallAttempts", s_callAttempts, kIni);
+        s_landing           = GetPrivateProfileIntA(kSection, "bLandingAssist", s_landing ? 1 : 0, kIni) != 0;
+        s_landingForward    = ReadFloat("fLandingForward", s_landingForward);
+        if(s_callRadius < 100.0f)       s_callRadius = 100.0f;
+        if(s_callRadius > 1500.0f)      s_callRadius = 1500.0f;
+        if(s_callWindowSec < 2.0f)      s_callWindowSec = 2.0f;
+        if(s_callWindowSec > 30.0f)     s_callWindowSec = 30.0f;
+        if(s_callAttempts < 1)          s_callAttempts = 1;
+        if(s_callAttempts > 6)          s_callAttempts = 6;
+        if(s_landingForward < 10.0f)    s_landingForward = 10.0f;
+        if(s_landingForward > 80.0f)    s_landingForward = 80.0f;
         s_trailMoveRadius   = ReadFloat("fTrailMoveRadius", s_trailMoveRadius);
         if(s_trailMoveRadius < 30.0f)   s_trailMoveRadius = 30.0f;
         if(s_trailMoveRadius > 300.0f)  s_trailMoveRadius = 300.0f;
@@ -1636,9 +1900,16 @@ namespace NpcParkour
         s_requestedAt   = GetTickCount();
     }
 
-    void RecordPlayerMove(int type, const NiPoint3 & startMark, const NiPoint3 & facing)
+    void RecordPlayerMove(int type, const NiPoint3 & startMark, const NiPoint3 & ledge, const NiPoint3 & facing)
     {
-        if(!s_enabled || !s_trailEnabled) return;
+        if(!s_enabled) return;
+
+        // The landing is the player's own, and does not need the trail.
+        s_playerMoveType    = type;
+        s_playerMoveLedge   = ledge;
+        s_playerMoveYaw     = atan2f(facing.x, facing.y);
+
+        if(!s_trailEnabled) return;
 
         // A grab is made in the air after a jump, and she cannot copy a jump.
         if(type == Parkour::kNoLedge || type == Parkour::kFailed || type == Parkour::kGrab) return;
@@ -1646,7 +1917,8 @@ namespace NpcParkour
         TrailNode node = MakeWalkNode(startMark, GetTickCount());
         node.isMove = true;
         node.type   = (Parkour::Type)type;
-        node.yaw    = atan2f(facing.x, facing.y);
+        node.yaw    = s_playerMoveYaw;
+        node.ledge  = ledge;
 
         TrailAppend(node);
 
@@ -1654,13 +1926,21 @@ namespace NpcParkour
                  TypeName((Parkour::Type)type), startMark.x, startMark.y, startMark.z, node.yaw, (unsigned int)s_trailCount);
     }
 
-    void RecordPlayerMoveEnd(const NiPoint3 & endPosition)
+    void RecordPlayerMoveEnd(Actor * player)
     {
-        if(!s_enabled || !s_trailEnabled || s_trailCount == 0) return;
+        if(!s_enabled || !player) return;
+
+        // First the landing, so that what is recorded is where he really ended up.
+        if(IsClimbType(s_playerMoveType))
+            ApplyLanding(player, s_playerMoveLedge, s_playerMoveYaw);
+        s_playerMoveType = -1;
+
+        if(!s_trailEnabled || s_trailCount == 0) return;
 
         TrailNode & last = s_trail[s_trailCount - 1];
         if(!last.isMove || last.hasEnd) return;
 
+        const NiPoint3 endPosition = Engine::Position(player);
         last.end    = endPosition;
         last.hasEnd = true;
 
@@ -1715,6 +1995,7 @@ namespace NpcParkour
         s_npc       = NULL;
         s_planValid   = false;
         s_trailRun    = false;
+        s_trailCall   = false;
         s_anchorReset = true;                   // the tracked NPC, if any, is kept
         ResetCorrection();
     }
@@ -1729,5 +2010,7 @@ namespace NpcParkour
         s_tracked   = NULL;
         s_trackedId = 0;
         s_trailCount = 0;                       // the old world's trail means nothing in the new one
+        s_callAfterTime = 0;
+        s_playerMoveType = -1;
     }
 }
