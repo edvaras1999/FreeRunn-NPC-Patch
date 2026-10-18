@@ -1,15 +1,16 @@
-# FreeRun LE + parkour em NPC (passo 4, versão npc10: ela responde aos teus movimentos)
+# FreeRun LE + parkour em NPC (passo 4, versão npc11: rumo corrigido e assentamento suave)
 
 Versão **de teste**, não para publicar. É o FreeRun LE 1.0.7 (código de 2 de outubro) com um módulo novo para NPCs. Tudo o que acontece fica no log (`Documentos\My Games\Skyrim\SKSE\FreerunLE.log`), nas linhas `NPC trail`, `NPC track` e `NPC landing`.
 
 > Aviso: não consegui compilar nem correr o jogo. A sintaxe do módulo novo foi verificada com os cabeçalhos do projeto. Se a compilação falhar, manda-me as linhas de erro do `build.log`.
 
-## O que mudou na npc10
-1. **O gatilho é o teu movimento do FreeRun** (e não a altura). Quando começas um movimento (vault, escalada), a seguidora seguida (F11) que está **atrás de ti** e a **menos de 500 unidades** do sítio onde o fizeste, com o caminho livre até esse ponto, **vai a esse mesmo sítio e faz o mesmo movimento**. Responde até 10 s depois de o teres feito, e responde aos teus movimentos pela ordem em que os fizeste. Se ela já passou o ponto (está do outro lado) ou já está tão alta como a escalada acabou, o movimento conta como respondido. Degraus pequenos não são copiados (ela sobe-os sozinha).
-2. **Assentamento no topo.** No fim de uma escalada (o teu e o dela), o corpo é pousado **em cima da superfície, um passo (38 unidades) para lá da aresta**. A animação acaba mesmo no bordo, e é aí que o corpo escorrega. O ponto é verificado antes: tem de haver chão à altura da aresta, o caminho até lá tem de estar livre, e não pode ficar longe de onde o corpo já está. Se não houver sítio seguro, fica onde a animação acabou. Isto aplica-se também ao **jogador** (no fim de uma escalada do FreeRun), e pode desligar-se (`bLandingAssist=0`).
-3. **Insistência.** Se ela não acabar em cima (abaixo da altura da aresta), **volta ao ponto de arranque e tenta outra vez**, até 3 tentativas, sem a largar à IA, que a mandaria pelo caminho longo.
+## O que mudou na npc11 (a partir do log da npc10)
+O log mostrou três causas para as falhas estranhas:
+1. **O rumo do corpo dela não acompanhava a rotação.** Com a física desligada, o controlador de personagem não segue uma rotação do ator; o "rumo" dele ficou parado durante o movimento todo. Em 14 das 17 repetições o erro de rumo no arranque foi de **44° a 175°**, e a animação move-a ao longo desse rumo: é o "escalar no ar, longe do local certo". Os piores resultados (subida negativa, deslocamento de 160 a 240 unidades) coincidem com os maiores erros. Agora o rumo do controlador é escrito diretamente, ela é **fixada no ponto de arranque, virada para o lado certo, a cada tick**, e o movimento só é enviado quando o rumo bate certo (ou ao fim de 0,6 s).
+2. **A ida a pé até ao ponto andava às voltas.** Cada passo partia de onde o motor a tinha deixado, e a IA dela continua a mexê-la, por isso o caminho virava um emaranhado (corpo a girar, deslizar, e duas vezes 25 s sem chegar). Agora o passo parte de uma posição **dela própria**, escrita todos os ticks. A chegada conta-se só na distância plana, o rumo só muda enquanto ainda falta caminho e a velocidades limitadas, e há um **prazo** para chegar (distância a dividir pela velocidade, mais 4 s).
+3. **O assentamento era um salto instantâneo** (até 62 unidades, uma vez 116). Agora é um **deslize suavizado de 0,28 s** (`iLandingGlideMs`), o limite caiu de 140 para 80 unidades, e o resultado dela só é avaliado quando o deslize acaba.
 
-O gatilho antigo (ela a correr sem se aproximar enquanto estás bem mais alto) mantém-se como segunda opção.
+Sobre o **passo com animação** que sugeriste: não é possível ainda. Para o corpo dar um passo "a sério" seria preciso guiar o grafo de locomoção (as variáveis de velocidade e direção) e não conheço uma forma de o fazer com o que o FreeRun já expõe. Fica o deslize suavizado como solução provisória, e a investigação desse passo como próximo ponto.
 
 ## 1. Compilar
 1. Atualiza o repositório do GitHub com **tudo** o que está neste ZIP.
@@ -17,7 +18,7 @@ O gatilho antigo (ela a correr sem se aproximar enquanto estás bem mais alto) m
 3. Descarrega o artefacto `resultado`: tem o `FreerunLE.dll` e o `build.log`.
 
 ## 2. Instalar
-Substitui `Data\SKSE\Plugins\FreerunLE.dll` (guarda uma cópia). O log deve dizer `Freerun LE 1.0.7-npc10`.
+Substitui `Data\SKSE\Plugins\FreerunLE.dll` (guarda uma cópia). O log deve dizer `Freerun LE 1.0.7-npc11`.
 
 ## 3. Testar
 1. Olha para a seguidora com a câmara e carrega **F11**.
@@ -34,6 +35,7 @@ fCallWindowSec=10     ; ... durante este tempo
 iCallAttempts=3       ; tentativas se não acabar em cima
 bLandingAssist=1      ; 0 desliga o assentamento no topo (nela e em ti)
 fLandingForward=38    ; quanto passa da aresta
+iLandingGlideMs=280   ; duração do deslize até lá (0 = instantâneo)
 bTrail=1
 bTrailWalk=0          ; 1 = também anda o rasto todo (experimental, deu problemas)
 fTrailMinHeight=120   ; gatilho antigo: tu tens de estar pelo menos isto acima dela

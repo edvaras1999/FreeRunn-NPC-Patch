@@ -78,6 +78,7 @@ namespace
     int     s_callAttempts      = 3;        // tries at one move if she does not end up on top
     bool    s_landing           = true;     // after a climb, rest the body on top of the edge
     float   s_landingForward    = 38.0f;    // ... this far past it
+    int     s_landingGlideMs    = 280;      // ... getting there over this long (0: at once)
     bool    s_manualToward      = true;     // F10: try the ledge between her and the player, from where she stands
     float   s_manualMaxGap      = 150.0f;   // F10: how far from the start mark she may be
 
@@ -92,7 +93,7 @@ namespace
 
     // ---- state: one NPC at a time -------------------------------------------
 
-    enum State { kIdle, kAligning, kWaitStart, kRunning, kTrail };
+    enum State { kIdle, kAligning, kWaitStart, kRunning, kTrail, kGlide };
 
     State           s_state         = kIdle;
     bool            s_requested     = false;
@@ -120,6 +121,27 @@ namespace
     DWORD           s_lastCallWhyLog    = 0;
     DWORD           s_lastPathCheck     = 0;
     NiPoint3        s_planLedge;                    // the top of the edge of the move being made
+    float           s_planYaw           = 0.0f;     // the heading the move is made with
+    bool            s_walkInit          = false;    // the walk to a start mark has its own position, kept here
+    float           s_walkPos[3]        = { 0.0f, 0.0f, 0.0f };
+    float           s_walkYaw           = 0.0f;
+    DWORD           s_approachDeadline  = 0;        // she must be at the start mark by then (0: no deadline)
+    DWORD           s_lastTook          = 0;
+    float           s_lastRise          = 0.0f;
+
+    // A short, eased move to the spot on top of an edge, instead of a jump to it.
+    struct Glide
+    {
+        bool    active;
+        bool    isPlayer;
+        Actor * who;
+        float   from[3];
+        float   to[3];
+        DWORD   start;
+        DWORD   ms;
+    };
+
+    Glide s_glide = { false, false, NULL, { 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f }, 0, 0 };
     int             s_playerMoveType    = -1;       // the player's own last move, for his landing
     NiPoint3        s_playerMoveLedge;
     float           s_playerMoveYaw     = 0.0f;
@@ -435,6 +457,46 @@ namespace
 
     // ---- 2..4. align, probe, start ------------------------------------------
 
+    // Turns her, for real. With her physics off, the character controller does not
+    // follow a turn of the actor on its own: its facing stayed where it was for the
+    // whole move, 44 to 175 degrees off in most of the repeated moves of the last
+    // log, and the animation moves her along that facing. That is what climbing
+    // "in the air, far from the right place" was. So the controller's own facing is
+    // written too (it is stored pointing backwards).
+    void SetHeading(Actor * npc, void * ctrl, float yaw)
+    {
+        Engine::Rotation(npc).z = yaw;
+
+        if(ctrl)
+        {
+            float * fwd = (float *)((UInt8 *)ctrl + Engine::Controller::kForwardVec);
+            fwd[0] = -sinf(yaw);
+            fwd[1] = -cosf(yaw);
+        }
+    }
+
+    // Holds her on the start mark, facing the way the move goes. While her physics
+    // are off the engine still moves her (it is her AI, running), so this is done
+    // every tick until the animation has taken over.
+    void PinPlan(Actor * npc)
+    {
+        void * ctrl = Engine::CharController(npc);
+        if(!ctrl) return;
+
+        const float scale = Engine::HavokScale();
+        __declspec(align(16)) float target[4];
+        target[0] = s_planStart.x * scale;
+        target[1] = s_planStart.y * scale;
+        target[2] = s_planStart.z * scale;
+        target[3] = 0.0f;
+        Engine::ControllerSetPosition(ctrl, target, true, false);
+
+        __declspec(align(16)) float stopped[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        Engine::ControllerSetLinearVelocity(ctrl, stopped);
+
+        SetHeading(npc, ctrl, s_planYaw);
+    }
+
     // Starts a move on an NPC whose ledge is already known. When `turn` is set she
     // is turned to `yaw` (the way the engine reads it: clockwise from north).
     // Her physics are switched off at once, so that she cannot run on while the
@@ -454,10 +516,11 @@ namespace
         if(ctrl)
             Engine::ControllerFlags(ctrl) |= Engine::Controller::kFlag_NoSim;
 
-        if(turn)
-            Engine::Rotation(npc).z = yaw;
+        s_planYaw = turn ? yaw : Engine::Rotation(npc).z;
+        SetHeading(npc, ctrl, s_planYaw);
 
-        s_stateStart = GetTickCount() - (kAlignMs - kPlanSettleMs);
+        s_walkInit   = false;
+        s_stateStart = GetTickCount();
     }
 
     void Begin(Actor * player)
@@ -893,6 +956,8 @@ namespace
         s_trailRun      = true;
         s_trailCall     = false;
         s_callAttemptsMade = 0;
+        s_walkInit      = false;
+        s_approachDeadline = 0;
         s_trailIdx      = entry;
         s_trailStart    = now;
         s_trailLastTick = now;
@@ -939,57 +1004,71 @@ namespace
     }
 
     // One step toward `target` (game coordinates) at `speed` game units a second.
-    // Returns how far is left after the step. She turns toward where she is going
-    // at a limited rate, because snapping her heading every tick made the run
-    // animation lean as if she were cornering hard. With `snap` set she is also
-    // put back on the ground under her, so that walking a path over uneven
-    // ground cannot take her below it.
+    // Returns how far is left, FLAT, after the step.
+    //
+    // The position is her own: kept in s_walkPos, advanced by the step, and written
+    // to the controller every tick. It is not read back from the controller, because
+    // her AI keeps moving her too, and a step taken from wherever the AI had put her
+    // last made the path a tangle: the spinning, the sliding, the 25 seconds spent
+    // circling a mark she never reached. She is also turned along her way by her
+    // own heading, only while she still has some way to go (a heading taken from
+    // a mark she is standing on spins), at a limited rate. With `snap` set she is
+    // kept on the ground under her.
     float TrailMoveToward(Actor * npc, void * ctrl, const NiPoint3 & target, float dt, float speed, bool snap)
     {
-        __declspec(align(16)) float current[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-        Engine::ControllerGetPosition(ctrl, current, true);
-
         const float scale = Engine::HavokScale();
-        const float mx = target.x * scale - current[0];
-        const float my = target.y * scale - current[1];
-        const float mz = target.z * scale - current[2];
-        const float distance = sqrtf(mx * mx + my * my + mz * mz);
-        if(distance < 0.0001f) return 0.0f;
 
-        const float left = distance / scale;                    // game units
-        const float stepGame = speed * dt;
-        const float k = (left <= stepGame) ? 1.0f : stepGame / left;
-
-        __declspec(align(16)) float next[4];
-        next[0] = current[0] + mx * k;
-        next[1] = current[1] + my * k;
-        next[2] = current[2] + mz * k;
-        next[3] = 0.0f;
-
-        if(snap)
+        if(!s_walkInit)
         {
-            float groundZ = 0.0f;
-            if(GroundAt(npc, next[0] / scale, next[1] / scale, next[2] / scale, groundZ))
-                next[2] = groundZ * scale;
+            __declspec(align(16)) float current[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            Engine::ControllerGetPosition(ctrl, current, true);
+            s_walkPos[0] = current[0];
+            s_walkPos[1] = current[1];
+            s_walkPos[2] = current[2];
+            s_walkYaw    = Engine::Rotation(npc).z;
+            s_walkInit   = true;
         }
 
+        const float mx = target.x * scale - s_walkPos[0];
+        const float my = target.y * scale - s_walkPos[1];
+        const float mz = target.z * scale - s_walkPos[2];
+        const float flat = sqrtf(mx * mx + my * my);
+        const float flatGame = flat / scale;
+
+        const float stepGame = speed * dt;
+        const float k = (flatGame <= stepGame || flat < 0.0001f) ? 1.0f : stepGame / flatGame;
+
+        s_walkPos[0] += mx * k;
+        s_walkPos[1] += my * k;
+
+        float groundZ = 0.0f;
+        if(snap && GroundAt(npc, s_walkPos[0] / scale, s_walkPos[1] / scale, s_walkPos[2] / scale, groundZ))
+            s_walkPos[2] = groundZ * scale;
+        else
+            s_walkPos[2] += mz * k;
+
+        __declspec(align(16)) float next[4];
+        next[0] = s_walkPos[0];
+        next[1] = s_walkPos[1];
+        next[2] = s_walkPos[2];
+        next[3] = 0.0f;
         Engine::ControllerSetPosition(ctrl, next, true, false);
 
-        if(fabsf(mx) + fabsf(my) > 2.0f * scale)
+        if(flatGame > 12.0f)
         {
             const float want = atan2f(mx, my);
-            const float have = Engine::Rotation(npc).z;
-            float diff = want - have;
+            float diff = want - s_walkYaw;
             while(diff >  3.14159265f) diff -= 6.28318531f;
             while(diff < -3.14159265f) diff += 6.28318531f;
 
             const float maxTurn = 5.0f * dt;                    // radians a second
             if(diff >  maxTurn) diff =  maxTurn;
             if(diff < -maxTurn) diff = -maxTurn;
-            Engine::Rotation(npc).z = have + diff;
+            s_walkYaw += diff;
         }
+        SetHeading(npc, ctrl, s_walkYaw);
 
-        return (left <= stepGame) ? 0.0f : left - stepGame;
+        return (flatGame <= stepGame) ? 0.0f : flatGame - stepGame;
     }
 
     // ---- step 4: landing, and answering the player's moves -------------------
@@ -1000,14 +1079,72 @@ namespace
                type == Parkour::kHigh || type == Parkour::kHighest;
     }
 
-    // Puts someone who has just finished a climb ON the surface: a step past the
-    // edge, on the ground there. The animation ends at the lip, and a body left at
-    // the lip tends to slide back down - which is what the player sees, and what
-    // made the follower give up and take the long way round instead of trying
-    // again. The spot is checked before anyone is moved: there has to be ground
-    // there at the height of the edge, the way to it has to be free of anything
-    // solid, and it has to be close to where the body already is.
-    bool ApplyLanding(Actor * who, const NiPoint3 & ledge, float yaw)
+    // Begins the eased move to `to` (game coordinates).
+    void StartGlide(Actor * who, void * ctrl, const NiPoint3 & to)
+    {
+        const float scale = Engine::HavokScale();
+
+        __declspec(align(16)) float current[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        Engine::ControllerGetPosition(ctrl, current, true);
+
+        s_glide.who      = who;
+        s_glide.isPlayer = (who == (Actor *)Engine::Player());
+        s_glide.from[0]  = current[0];
+        s_glide.from[1]  = current[1];
+        s_glide.from[2]  = current[2];
+        s_glide.to[0]    = to.x * scale;
+        s_glide.to[1]    = to.y * scale;
+        s_glide.to[2]    = to.z * scale;
+        s_glide.start    = GetTickCount();
+        s_glide.ms       = (DWORD)s_landingGlideMs;
+        s_glide.active   = true;
+    }
+
+    // Once per tick, while a glide is running.
+    void TickGlide(DWORD now)
+    {
+        if(!s_glide.active) return;
+
+        if(!s_glide.isPlayer && !SafeUsable(s_glide.who))
+        {
+            s_glide.active = false;
+            return;
+        }
+
+        void * ctrl = Engine::CharController(s_glide.who);
+        if(!ctrl)
+        {
+            s_glide.active = false;
+            return;
+        }
+
+        float s = (s_glide.ms == 0) ? 1.0f : (float)(now - s_glide.start) / (float)s_glide.ms;
+        if(s > 1.0f) s = 1.0f;
+        const float e = s * s * (3.0f - 2.0f * s);              // eased in and out
+
+        __declspec(align(16)) float target[4];
+        for(int i = 0; i < 3; ++i)
+            target[i] = s_glide.from[i] + (s_glide.to[i] - s_glide.from[i]) * e;
+        target[3] = 0.0f;
+        Engine::ControllerSetPosition(ctrl, target, true, false);
+
+        __declspec(align(16)) float stopped[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        Engine::ControllerSetLinearVelocity(ctrl, stopped);
+
+        if(s >= 1.0f)
+            s_glide.active = false;
+    }
+
+    // Rests someone who has just finished a climb ON the surface: a step past the
+    // edge, on the ground there, reached with a short glide rather than a jump. The
+    // animation ends at the lip, and a body left at the lip tends to slide back
+    // down - which is what the player sees, and what made the follower give up and
+    // take the long way round instead of trying again. The spot is checked before
+    // anyone is moved: there has to be ground there at the height of the edge, the
+    // way to it has to be free of anything solid, and it has to be close to where
+    // the body already is. Returns true if a move was begun; `outLanding` is where
+    // it goes.
+    bool ApplyLanding(Actor * who, const NiPoint3 & ledge, float yaw, NiPoint3 * outLanding)
     {
         if(!s_landing || !who) return false;
 
@@ -1037,22 +1174,15 @@ namespace
             const float dz = landing.z - here.z;
             const float moveBy = sqrtf(dx * dx + dy * dy + dz * dz);
 
-            if(moveBy > 140.0f) continue;                       // nowhere near where it should be
-            if(moveBy < 4.0f) return true;                      // already there
+            if(moveBy > 80.0f) continue;                        // nowhere near where it should be
+            if(moveBy < 4.0f) return false;                     // already there
             if(!PathClear(who, here, landing)) continue;        // something solid in the way
 
-            const float scale = Engine::HavokScale();
-            __declspec(align(16)) float target[4];
-            target[0] = landing.x * scale;
-            target[1] = landing.y * scale;
-            target[2] = landing.z * scale;
-            target[3] = 0.0f;
-            Engine::ControllerSetPosition(ctrl, target, true, false);
+            StartGlide(who, ctrl, landing);
+            if(outLanding) *outLanding = landing;
 
-            __declspec(align(16)) float stopped[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-            Engine::ControllerSetLinearVelocity(ctrl, stopped);
-
-            _MESSAGE("NPC landing: moved %.0f units to rest on top of the edge (%.0f past it)", moveBy, tries[t]);
+            _MESSAGE("NPC landing: moving %.0f units over %d ms to rest on top of the edge (%.0f past it)",
+                     moveBy, s_landingGlideMs, tries[t]);
             return true;
         }
 
@@ -1133,6 +1263,8 @@ namespace
         s_trailLastTick     = now;
         s_lastPathCheck     = now;
         s_trailMoves        = 0;
+        s_walkInit          = false;
+        s_approachDeadline  = now + (DWORD)((markDistance / s_trailSpeed) * 1000.0f + 4000.0f);
 
         void * ctrl = Engine::CharController(npc);
         if(ctrl)
@@ -1211,6 +1343,15 @@ namespace
             }
         }
 
+        // She has a limited time to get to the mark: a way that took 25 seconds
+        // meant she was not going to.
+        if(s_trailCall && s_approachDeadline != 0 && now > s_approachDeadline)
+        {
+            s_callAfterTime = s_callNodeTime;
+            TrailEnd(npc, "could not get to the start mark in time", true);
+            return;
+        }
+
         const bool onFoot = s_trailCall || s_trailWalk;
         const float left = TrailMoveToward(npc, ctrl, node.pos, dt, onFoot ? s_trailSpeed : s_dashSpeed,
                                            s_trailCall || (s_trailWalk && !node.isMove));
@@ -1232,25 +1373,17 @@ namespace
             s_planType      = node.type;
             s_planStart     = node.pos;
             s_planLedge     = node.ledge;
-            Engine::Rotation(npc).z = node.yaw;
+            s_planYaw       = node.yaw;
+            s_walkInit      = false;
             s_state         = kAligning;
-            s_stateStart    = now - (kAlignMs - kPlanSettleMs);
+            s_stateStart    = now;
             // s_trailIdx moves on when the move ends (Succeed)
         }
     }
 
-    void Succeed(Actor * npc, DWORD now)
+    // What follows a move that is over and, if it was a climb, landed.
+    void FinishSuccess(Actor * npc, DWORD now)
     {
-        const NiPoint3 after = Engine::Position(npc);
-        const DWORD took = now - s_actionStart;
-
-        _MESSAGE("NPC test: finished after %lu ms, moved from (%.0f, %.0f, %.0f) to (%.0f, %.0f, %.0f)",
-                 (unsigned long)took, s_posBefore.x, s_posBefore.y, s_posBefore.z, after.x, after.y, after.z);
-
-        // The animation ends at the lip of the edge: rest her on top of it.
-        if(s_landing && IsClimbType(s_type))
-            ApplyLanding(npc, s_planLedge, Engine::Rotation(npc).z);
-
         if(s_trailRun && !s_trailWalk)
         {
             // Did she end up on top? If not, she goes back to the start mark and
@@ -1271,9 +1404,11 @@ namespace
                 ++s_callAttemptsMade;
                 _MESSAGE("NPC trail: she did not end up on top: back to the start mark to try again (attempt %u of %d)",
                          (unsigned int)(s_callAttemptsMade + 1), s_callAttempts);
-                s_state         = kTrail;
-                s_planValid     = false;
-                s_trailLastTick = now;
+                s_state             = kTrail;
+                s_planValid         = false;
+                s_trailLastTick     = now;
+                s_walkInit          = false;
+                s_approachDeadline  = now + 8000;
                 ResetCorrection();
                 return;
             }
@@ -1295,11 +1430,11 @@ namespace
             s_state         = kTrail;
             s_trailLastTick = now;
             s_planValid     = false;
+            s_walkInit      = false;
             ResetCorrection();
             return;
         }
 
-        const float rise = after.z - s_posBefore.z;
         const Parkour::Type type = s_type;
 
         EndTest(true, true);
@@ -1308,8 +1443,31 @@ namespace
         sprintf_s(text, sizeof(text),
                   "FreeRun NPC test: finished.\n\nMove: %s\nTime: %lu ms\nHeight change: %.0f units\n\n"
                   "If it did not look right, send FreerunLE.log.",
-                  TypeName(type), (unsigned long)took, rise);
+                  TypeName(type), (unsigned long)s_lastTook, s_lastRise);
         if(s_manual) ShowText(text);
+    }
+
+    void Succeed(Actor * npc, DWORD now)
+    {
+        const NiPoint3 after = Engine::Position(npc);
+        s_lastTook = now - s_actionStart;
+        s_lastRise = after.z - s_posBefore.z;
+
+        _MESSAGE("NPC test: finished after %lu ms, moved from (%.0f, %.0f, %.0f) to (%.0f, %.0f, %.0f)",
+                 (unsigned long)s_lastTook, s_posBefore.x, s_posBefore.y, s_posBefore.z, after.x, after.y, after.z);
+
+        // The animation ends at the lip of the edge: she is eased onto the top of
+        // it, and what follows waits until she has got there.
+        if(s_landing && IsClimbType(s_type))
+        {
+            if(ApplyLanding(npc, s_planLedge, Engine::Rotation(npc).z, NULL))
+            {
+                s_state = kGlide;
+                return;
+            }
+        }
+
+        FinishSuccess(npc, now);
     }
 
     void Step()
@@ -1329,8 +1487,32 @@ namespace
         switch(s_state)
         {
             case kAligning:
+                if(s_planValid)
+                {
+                    // On the mark, facing the way the move goes: written every tick,
+                    // and the move is only sent once her facing really matches.
+                    PinPlan(npc);
+
+                    const NiPoint3 f = Parkour::FacingFlat(npc);
+                    const bool faces = (f.x * sinf(s_planYaw) + f.y * cosf(s_planYaw)) >= 0.985f;     // about ten degrees
+                    const DWORD waited = now - s_stateStart;
+
+                    if((faces && waited >= 50) || waited >= 600)
+                    {
+                        if(!faces)
+                            _MESSAGE("NPC test: her facing never matched the move's heading: going on anyway");
+                        ProbeAndStart();
+                    }
+                    return;
+                }
+
                 if(now - s_stateStart >= kAlignMs)
                     ProbeAndStart();
+                return;
+
+            case kGlide:
+                if(!s_glide.active)
+                    FinishSuccess(npc, now);
                 return;
 
             case kTrail:
@@ -1339,7 +1521,8 @@ namespace
 
             case kWaitStart:
             {
-                RunCorrection(npc);
+                if(s_planValid) PinPlan(npc);       // held on the mark until the animation takes over
+                else            RunCorrection(npc);
 
                 if(Graph::GetBool(npc, n.ongoing))
                 {
@@ -1365,7 +1548,7 @@ namespace
 
             case kRunning:
             {
-                RunCorrection(npc);
+                if(!s_planValid) RunCorrection(npc);    // (with a plan, she is already on the mark)
 
                 if(Parkour::IsKnockedOut(npc) || Parkour::IsStaggering(npc))
                 {
@@ -1786,6 +1969,7 @@ namespace
     void TickInner(Actor * player)
     {
         TrailSample(player);
+        TickGlide(GetTickCount());
 
         if(s_state == kIdle)
         {
@@ -1854,6 +2038,9 @@ namespace NpcParkour
         s_callAttempts      = GetPrivateProfileIntA(kSection, "iCallAttempts", s_callAttempts, kIni);
         s_landing           = GetPrivateProfileIntA(kSection, "bLandingAssist", s_landing ? 1 : 0, kIni) != 0;
         s_landingForward    = ReadFloat("fLandingForward", s_landingForward);
+        s_landingGlideMs    = GetPrivateProfileIntA(kSection, "iLandingGlideMs", s_landingGlideMs, kIni);
+        if(s_landingGlideMs < 0)        s_landingGlideMs = 0;
+        if(s_landingGlideMs > 800)      s_landingGlideMs = 800;
         if(s_callRadius < 100.0f)       s_callRadius = 100.0f;
         if(s_callRadius > 1500.0f)      s_callRadius = 1500.0f;
         if(s_callWindowSec < 2.0f)      s_callWindowSec = 2.0f;
@@ -1930,9 +2117,11 @@ namespace NpcParkour
     {
         if(!s_enabled || !player) return;
 
-        // First the landing, so that what is recorded is where he really ended up.
+        // First the landing, so that what is recorded is where he really ends up.
+        NiPoint3 landing(0.0f, 0.0f, 0.0f);
+        bool landed = false;
         if(IsClimbType(s_playerMoveType))
-            ApplyLanding(player, s_playerMoveLedge, s_playerMoveYaw);
+            landed = ApplyLanding(player, s_playerMoveLedge, s_playerMoveYaw, &landing);
         s_playerMoveType = -1;
 
         if(!s_trailEnabled || s_trailCount == 0) return;
@@ -1940,7 +2129,7 @@ namespace NpcParkour
         TrailNode & last = s_trail[s_trailCount - 1];
         if(!last.isMove || last.hasEnd) return;
 
-        const NiPoint3 endPosition = Engine::Position(player);
+        const NiPoint3 endPosition = landed ? landing : Engine::Position(player);
         last.end    = endPosition;
         last.hasEnd = true;
 
@@ -1996,6 +2185,7 @@ namespace NpcParkour
         s_planValid   = false;
         s_trailRun    = false;
         s_trailCall   = false;
+        s_glide.active = false;
         s_anchorReset = true;                   // the tracked NPC, if any, is kept
         ResetCorrection();
     }
@@ -2012,5 +2202,6 @@ namespace NpcParkour
         s_trailCount = 0;                       // the old world's trail means nothing in the new one
         s_callAfterTime = 0;
         s_playerMoveType = -1;
+        s_glide.active = false;
     }
 }
