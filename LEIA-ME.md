@@ -1,16 +1,24 @@
-# FreeRun LE + parkour em NPC (passo 4, versão npc11: rumo corrigido e assentamento suave)
+# FreeRun LE + parkour em NPC (passo 4, versão npc12: o caminho do teu corpo)
 
 Versão **de teste**, não para publicar. É o FreeRun LE 1.0.7 (código de 2 de outubro) com um módulo novo para NPCs. Tudo o que acontece fica no log (`Documentos\My Games\Skyrim\SKSE\FreerunLE.log`), nas linhas `NPC trail`, `NPC track` e `NPC landing`.
 
 > Aviso: não consegui compilar nem correr o jogo. A sintaxe do módulo novo foi verificada com os cabeçalhos do projeto. Se a compilação falhar, manda-me as linhas de erro do `build.log`.
 
-## O que mudou na npc11 (a partir do log da npc10)
-O log mostrou três causas para as falhas estranhas:
-1. **O rumo do corpo dela não acompanhava a rotação.** Com a física desligada, o controlador de personagem não segue uma rotação do ator; o "rumo" dele ficou parado durante o movimento todo. Em 14 das 17 repetições o erro de rumo no arranque foi de **44° a 175°**, e a animação move-a ao longo desse rumo: é o "escalar no ar, longe do local certo". Os piores resultados (subida negativa, deslocamento de 160 a 240 unidades) coincidem com os maiores erros. Agora o rumo do controlador é escrito diretamente, ela é **fixada no ponto de arranque, virada para o lado certo, a cada tick**, e o movimento só é enviado quando o rumo bate certo (ou ao fim de 0,6 s).
-2. **A ida a pé até ao ponto andava às voltas.** Cada passo partia de onde o motor a tinha deixado, e a IA dela continua a mexê-la, por isso o caminho virava um emaranhado (corpo a girar, deslizar, e duas vezes 25 s sem chegar). Agora o passo parte de uma posição **dela própria**, escrita todos os ticks. A chegada conta-se só na distância plana, o rumo só muda enquanto ainda falta caminho e a velocidades limitadas, e há um **prazo** para chegar (distância a dividir pela velocidade, mais 4 s).
-3. **O assentamento era um salto instantâneo** (até 62 unidades, uma vez 116). Agora é um **deslize suavizado de 0,28 s** (`iLandingGlideMs`), o limite caiu de 140 para 80 unidades, e o resultado dela só é avaliado quando o deslize acaba.
+## O que mudou na npc12 (a partir do log da npc11)
+O que o log da npc11 mostrou:
+- **O rumo ficou resolvido:** em 23 repetições o erro de rumo foi de 0° a 6° (antes, 44° a 175°).
+- **19 de 23 repetições acabaram em cima** (de +96 a +198). As 4 más foram **a descer e de lado**: em "climb low" com a animação a correr, o corpo dela foi para baixo a um ritmo constante (cerca de 75 unidades por segundo, 100 unidades em 1,4 s) e 76 unidades para o lado, com o estado do controlador "no chão". Ela tinha começado o movimento numa encosta, e foi escorregando por ela: **a física dela estava a atuar, apesar de eu a ter desligado**. É a "luta com a IA" que notaste: o motor (a IA dela e a física) continua a mexer-lhe no corpo, e o que eu faço por cima é desfeito.
+- **Quando não responde:** 77 vezes. 46 por "algo sólido entre ela e o sítio" (a minha verificação do caminho varria um plano horizontal, que bate no chão a subir ao pé de qualquer encosta) e 31 por estar longe.
 
-Sobre o **passo com animação** que sugeriste: não é possível ainda. Para o corpo dar um passo "a sério" seria preciso guiar o grafo de locomoção (as variáveis de velocidade e direção) e não conheço uma forma de o fazer com o que o FreeRun já expõe. Fica o deslize suavizado como solução provisória, e a investigação desse passo como próximo ponto.
+Por isso:
+1. **O corpo dela é levado ao longo do caminho que o teu corpo fez.** Durante cada movimento teu, o plugin grava, tick a tick, onde o teu corpo está, relativamente ao ponto de arranque, e tira a parte do "puxão" ao ponto (ela já começa no ponto). Quando ela repete o movimento, o plugin **escreve a posição dela em cada tick** ao longo desse caminho, com a animação dela a tocar. O motor deixa de ser quem a move, e não há nada com que a IA ou a física possam lutar. Isto vale para os movimentos que ela repete a partir do rasto (a resposta aos teus movimentos). Podes desligar com `bPathReplay=0`.
+2. O **NoSim é reafirmado a cada tick** enquanto ela está a ser levada.
+3. **A verificação do caminho** passou a seguir o chão: troços de até 120 unidades, cada um à altura da cintura **por cima do chão desse sítio**, e o chão onde se pode andar já não conta como obstáculo.
+
+## Como funciona (resumo)
+- **O rasto:** o plugin grava as tuas posições e, sempre que o FreeRun começa um movimento teu, o movimento (tipo, ponto de arranque, direção, caminho do corpo, onde acabaste).
+- **Seguidora seguida (F11):** quando fazes um movimento, a que está atrás de ti, a menos de 500 unidades e com o caminho livre, **vai ao mesmo sítio, a pé, e faz o mesmo**, levada ao longo do teu caminho. Se não acabar em cima, volta a tentar (até 3 vezes). O fim de cada escalada é um deslize suave para cima da superfície (`iLandingGlideMs`).
+- **Combate:** com a arma na mão, não começa; se sacar a arma a meio, pára.
 
 ## 1. Compilar
 1. Atualiza o repositório do GitHub com **tudo** o que está neste ZIP.
@@ -18,7 +26,7 @@ Sobre o **passo com animação** que sugeriste: não é possível ainda. Para o 
 3. Descarrega o artefacto `resultado`: tem o `FreerunLE.dll` e o `build.log`.
 
 ## 2. Instalar
-Substitui `Data\SKSE\Plugins\FreerunLE.dll` (guarda uma cópia). O log deve dizer `Freerun LE 1.0.7-npc11`.
+Substitui `Data\SKSE\Plugins\FreerunLE.dll` (guarda uma cópia). O log deve dizer `Freerun LE 1.0.7-npc12`.
 
 ## 3. Testar
 1. Olha para a seguidora com a câmara e carrega **F11**.
@@ -36,6 +44,7 @@ iCallAttempts=3       ; tentativas se não acabar em cima
 bLandingAssist=1      ; 0 desliga o assentamento no topo (nela e em ti)
 fLandingForward=38    ; quanto passa da aresta
 iLandingGlideMs=280   ; duração do deslize até lá (0 = instantâneo)
+bPathReplay=1         ; ela é levada ao longo do caminho que o teu corpo fez (0 = deixar ao motor)
 bTrail=1
 bTrailWalk=0          ; 1 = também anda o rasto todo (experimental, deu problemas)
 fTrailMinHeight=120   ; gatilho antigo: tu tens de estar pelo menos isto acima dela

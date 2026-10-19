@@ -39,6 +39,7 @@ namespace NpcParkour
     // so that a follower can repeat it later (the player's trail, step 3).
     void    RecordPlayerMove(int type, const NiPoint3 & startMark, const NiPoint3 & ledge, const NiPoint3 & facing);
     void    RecordPlayerMoveEnd(Actor * player);
+    void    RecordPlayerMoveSample(const NiPoint3 & position);     // every tick of one of his moves
     void    Reset();                    // graph rebuilt: forget the running move (the tracked NPC is kept)
     void    Forget();                   // a load or a new game: forget the running move AND the tracked NPC
 }

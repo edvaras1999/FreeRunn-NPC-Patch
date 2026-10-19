@@ -1019,6 +1019,9 @@ namespace Parkour
 
 		if(s_inProgress)
 		{
+			// NPC TEST BUILD: the path the body takes, for a follower to repeat.
+			NpcParkour::RecordPlayerMoveSample(Engine::Position(player));
+
 			RunCorrection(player);
 			InvalidateLedge();
 			return;

@@ -79,6 +79,7 @@ namespace
     bool    s_landing           = true;     // after a climb, rest the body on top of the edge
     float   s_landingForward    = 38.0f;    // ... this far past it
     int     s_landingGlideMs    = 280;      // ... getting there over this long (0: at once)
+    bool    s_pathReplay        = true;     // she is carried along the path his body took, instead of left to the engine
     bool    s_manualToward      = true;     // F10: try the ledge between her and the player, from where she stands
     float   s_manualMaxGap      = 150.0f;   // F10: how far from the start mark she may be
 
@@ -142,6 +143,35 @@ namespace
     };
 
     Glide s_glide = { false, false, NULL, { 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f }, 0, 0 };
+
+    // The path the player's body takes during one of his moves: where it is, a tick
+    // at a time, relative to where it started (and with his own pull toward the
+    // start mark taken out, which she does not need: she starts ON the mark).
+    // A follower repeating the move is carried along that path, every tick, while
+    // her own animation plays. The engine is then not what moves her, and there is
+    // nothing for her AI or her physics to fight with: the logs showed her sliding
+    // down the slope she started the climb on, at a steady 75 units a second, as
+    // though her physics were running.
+    enum { kPathMax = 6, kPathSamples = 240 };
+
+    struct MovePath
+    {
+        DWORD   nodeTime;               // the trail node this belongs to
+        UInt32  count;
+        DWORD   t[kPathSamples];        // milliseconds since the move began
+        float   x[kPathSamples];
+        float   y[kPathSamples];
+        float   z[kPathSamples];
+    };
+
+    MovePath    s_paths[kPathMax];
+    UInt32      s_pathNext          = 0;
+    MovePath *  s_recording         = NULL;     // the one being written, if one of his moves is under way
+    DWORD       s_recordStart       = 0;
+    UInt32      s_recordTicks       = 0;
+    NiPoint3    s_recordOrigin;                 // where his body was when the move was decided
+    NiPoint3    s_recordMissing;                // the gap to the start mark, which the engine closes over 30 ticks
+    MovePath *  s_planPath          = NULL;     // the path the running move is carried along
     int             s_playerMoveType    = -1;       // the player's own last move, for his landing
     NiPoint3        s_playerMoveLedge;
     float           s_playerMoveYaw     = 0.0f;
@@ -384,6 +414,7 @@ namespace
         s_npc       = NULL;
         s_requested = false;
         s_planValid = false;
+        s_planPath  = NULL;
         s_trailRun  = false;
         s_trailCall = false;
         ResetCorrection();
@@ -494,6 +525,56 @@ namespace
         __declspec(align(16)) float stopped[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
         Engine::ControllerSetLinearVelocity(ctrl, stopped);
 
+        Engine::ControllerFlags(ctrl) |= Engine::Controller::kFlag_NoSim;       // asserted every tick: nothing is to switch it back on
+        SetHeading(npc, ctrl, s_planYaw);
+    }
+
+    // The recorded path, `elapsed` milliseconds into the move: how far the body has
+    // gone from where it started. False if there is nothing to follow.
+    bool PathAt(const MovePath * path, DWORD elapsed, NiPoint3 & out)
+    {
+        if(!path || path->count < 2) return false;
+
+        const UInt32 last = path->count - 1;
+        if(elapsed >= path->t[last])
+        {
+            out = NiPoint3(path->x[last], path->y[last], path->z[last]);
+            return true;
+        }
+
+        UInt32 i = 0;
+        while(i + 1 < last && path->t[i + 1] <= elapsed) ++i;
+
+        const float span = (float)(path->t[i + 1] - path->t[i]);
+        const float f = (span > 0.0f) ? (float)(elapsed - path->t[i]) / span : 0.0f;
+
+        out = NiPoint3(path->x[i] + (path->x[i + 1] - path->x[i]) * f,
+                       path->y[i] + (path->y[i + 1] - path->y[i]) * f,
+                       path->z[i] + (path->z[i + 1] - path->z[i]) * f);
+        return true;
+    }
+
+    // Carries her along the path, tick by tick, from the start mark.
+    void ReplayPath(Actor * npc, DWORD now)
+    {
+        void * ctrl = Engine::CharController(npc);
+        if(!ctrl) return;
+
+        NiPoint3 d(0.0f, 0.0f, 0.0f);
+        if(!PathAt(s_planPath, now - s_actionStart, d)) return;
+
+        const float scale = Engine::HavokScale();
+        __declspec(align(16)) float target[4];
+        target[0] = (s_planStart.x + d.x) * scale;
+        target[1] = (s_planStart.y + d.y) * scale;
+        target[2] = (s_planStart.z + d.z) * scale;
+        target[3] = 0.0f;
+        Engine::ControllerSetPosition(ctrl, target, true, false);
+
+        __declspec(align(16)) float stopped[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        Engine::ControllerSetLinearVelocity(ctrl, stopped);
+
+        Engine::ControllerFlags(ctrl) |= Engine::Controller::kFlag_NoSim;
         SetHeading(npc, ctrl, s_planYaw);
     }
 
@@ -505,6 +586,7 @@ namespace
     void StartOn(Actor * npc, bool turn, float yaw, bool manual, Parkour::Type type, const NiPoint3 & start, const NiPoint3 & ledge)
     {
         s_planLedge = ledge;
+        s_planPath  = NULL;
         s_manual    = manual;
         s_npc       = npc;
         s_state     = kAligning;
@@ -741,6 +823,7 @@ namespace
         NiPoint3        pos;            // a position; for a move, its start mark
         NiPoint3        end;            // moves only: where the player ended up
         NiPoint3        ledge;          // moves only: the top of the edge he climbed
+        int             path;           // moves only: which recorded path (s_paths), or -1
     };
 
     enum { kTrailMax = 300 };
@@ -775,6 +858,7 @@ namespace
         node.pos    = pos;
         node.end    = pos;
         node.ledge  = pos;
+        node.path   = -1;
         return node;
     }
 
@@ -829,8 +913,14 @@ namespace
         TrailAppend(MakeWalkNode(pos, now));
     }
 
-    // Is the way from `from` to `to` free of anything solid, at waist height? A
-    // sphere is swept along it, and characters are not counted.
+    bool GroundAt(Actor * npc, float x, float y, float z, float & outZ);
+
+    // Is the way from `from` to `to` free of anything solid, at waist height? The
+    // way is taken in pieces of at most 120 units, each at waist height over the
+    // ground THERE: one level sweep from start to end, as this used to be, ran into
+    // the rising ground at the foot of a slope and refused 46 of the player's moves.
+    // A sphere is swept along each piece; characters, and ground a body can walk
+    // on, are not counted.
     bool PathClear(Actor * npc, const NiPoint3 & from, const NiPoint3 & to)
     {
         const float dx = to.x - from.x;
@@ -838,16 +928,44 @@ namespace
         const float horizontal = sqrtf(dx * dx + dy * dy);
         if(horizontal < 5.0f) return true;
 
-        const NiPoint3 start(from.x, from.y, from.z + 45.0f);
-        const NiPoint3 direction(dx / horizontal, dy / horizontal, 0.0f);
+        int pieces = (int)(horizontal / 120.0f) + 1;
+        if(pieces > 6) pieces = 6;
 
-        const Havok::Result r = Havok::ShapeCast(start, direction, horizontal, 20.0f, Havok::kLayer_Transparent, npc);
-        for(UInt32 h = 0; h < r.hitCount; ++h)
+        NiPoint3 previous(from.x, from.y, from.z + 45.0f);
+
+        for(int i = 1; i <= pieces; ++i)
         {
-            const Havok::Hit & hit = r.hits[h];
-            if(hit.layer == Havok::kLayer_CharController || hit.layer == Havok::kLayer_Biped) continue;
-            if(hit.distance < horizontal - 10.0f) return false;
+            const float f = (float)i / (float)pieces;
+            const float px = from.x + dx * f;
+            const float py = from.y + dy * f;
+            float pz = from.z + (to.z - from.z) * f;
+
+            float groundZ = 0.0f;
+            if(GroundAt(npc, px, py, pz, groundZ)) pz = groundZ;
+
+            const NiPoint3 next(px, py, pz + 45.0f);
+            const float sx = next.x - previous.x;
+            const float sy = next.y - previous.y;
+            const float sz = next.z - previous.z;
+            const float length = sqrtf(sx * sx + sy * sy + sz * sz);
+
+            if(length > 1.0f)
+            {
+                const NiPoint3 direction(sx / length, sy / length, sz / length);
+                const Havok::Result r = Havok::ShapeCast(previous, direction, length, 20.0f, Havok::kLayer_Transparent, npc);
+
+                for(UInt32 h = 0; h < r.hitCount; ++h)
+                {
+                    const Havok::Hit & hit = r.hits[h];
+                    if(hit.layer == Havok::kLayer_CharController || hit.layer == Havok::kLayer_Biped) continue;
+                    if(hit.normal.z > 0.6f) continue;                       // ground to walk on
+                    if(hit.distance < length - 10.0f) return false;
+                }
+            }
+
+            previous = next;
         }
+
         return true;
     }
 
@@ -1374,6 +1492,14 @@ namespace
             s_planStart     = node.pos;
             s_planLedge     = node.ledge;
             s_planYaw       = node.yaw;
+            s_planPath      = NULL;
+            if(s_pathReplay && node.path >= 0 && node.path < (int)kPathMax &&
+               s_paths[node.path].nodeTime == node.time && s_paths[node.path].count > 3)
+            {
+                s_planPath = &s_paths[node.path];
+                _MESSAGE("NPC trail: carried along the path his body took (%u samples, %u ms)",
+                         (unsigned int)s_planPath->count, (unsigned int)s_planPath->t[s_planPath->count - 1]);
+            }
             s_walkInit      = false;
             s_state         = kAligning;
             s_stateStart    = now;
@@ -1521,8 +1647,9 @@ namespace
 
             case kWaitStart:
             {
-                if(s_planValid) PinPlan(npc);       // held on the mark until the animation takes over
-                else            RunCorrection(npc);
+                if(s_planPath)          ReplayPath(npc, now);       // carried along his path from the first tick
+                else if(s_planValid)    PinPlan(npc);               // held on the mark until the animation takes over
+                else                    RunCorrection(npc);
 
                 if(Graph::GetBool(npc, n.ongoing))
                 {
@@ -1548,7 +1675,8 @@ namespace
 
             case kRunning:
             {
-                if(!s_planValid) RunCorrection(npc);    // (with a plan, she is already on the mark)
+                if(s_planPath)          ReplayPath(npc, now);
+                else if(!s_planValid)   RunCorrection(npc);     // (with a plan, she is already on the mark)
 
                 if(Parkour::IsKnockedOut(npc) || Parkour::IsStaggering(npc))
                 {
@@ -2039,6 +2167,7 @@ namespace NpcParkour
         s_landing           = GetPrivateProfileIntA(kSection, "bLandingAssist", s_landing ? 1 : 0, kIni) != 0;
         s_landingForward    = ReadFloat("fLandingForward", s_landingForward);
         s_landingGlideMs    = GetPrivateProfileIntA(kSection, "iLandingGlideMs", s_landingGlideMs, kIni);
+        s_pathReplay        = GetPrivateProfileIntA(kSection, "bPathReplay", s_pathReplay ? 1 : 0, kIni) != 0;
         if(s_landingGlideMs < 0)        s_landingGlideMs = 0;
         if(s_landingGlideMs > 800)      s_landingGlideMs = 800;
         if(s_callRadius < 100.0f)       s_callRadius = 100.0f;
@@ -2095,6 +2224,7 @@ namespace NpcParkour
         s_playerMoveType    = type;
         s_playerMoveLedge   = ledge;
         s_playerMoveYaw     = atan2f(facing.x, facing.y);
+        s_recording         = NULL;
 
         if(!s_trailEnabled) return;
 
@@ -2107,15 +2237,64 @@ namespace NpcParkour
         node.yaw    = s_playerMoveYaw;
         node.ledge  = ledge;
 
+        // The path of his body during the move: this node's, from now until it ends.
+        if(s_pathReplay && type != Parkour::kStepLow && type != Parkour::kStepHigh)
+        {
+            const int slot = (int)s_pathNext;
+            s_pathNext = (s_pathNext + 1) % kPathMax;
+
+            MovePath & path = s_paths[slot];
+            path.nodeTime   = node.time;
+            path.count      = 0;
+
+            const NiPoint3 origin = Engine::Position((Actor *)Engine::Player());
+            s_recordOrigin  = origin;
+            s_recordMissing = NiPoint3(startMark.x - origin.x, startMark.y - origin.y, startMark.z - origin.z);
+            s_recordStart   = GetTickCount();
+            s_recordTicks   = 0;
+            s_recording     = &path;
+            node.path       = slot;
+
+            path.t[0] = 0; path.x[0] = 0.0f; path.y[0] = 0.0f; path.z[0] = 0.0f;
+            path.count = 1;
+        }
+
         TrailAppend(node);
 
         _MESSAGE("NPC trail: recorded the player's %s from (%.0f, %.0f, %.0f), heading %.2f (%u nodes)",
                  TypeName((Parkour::Type)type), startMark.x, startMark.y, startMark.z, node.yaw, (unsigned int)s_trailCount);
     }
 
+    // One sample of the body, every tick of one of the player's moves. The engine
+    // closes the gap to the start mark over thirty ticks, a thirtieth of it a tick
+    // from the second tick on; that part is taken out, so that what is kept is the
+    // movement of the animation itself, from where the body began.
+    void RecordPlayerMoveSample(const NiPoint3 & position)
+    {
+        if(!s_recording || s_recording->count >= (UInt32)kPathSamples) return;
+
+        ++s_recordTicks;
+        const float done = (s_recordTicks > 1) ? (float)(s_recordTicks - 1) / 30.0f : 0.0f;
+        const float share = (done > 1.0f) ? 1.0f : done;
+
+        const UInt32 i = s_recording->count++;
+        s_recording->t[i] = GetTickCount() - s_recordStart;
+        s_recording->x[i] = position.x - s_recordOrigin.x - s_recordMissing.x * share;
+        s_recording->y[i] = position.y - s_recordOrigin.y - s_recordMissing.y * share;
+        s_recording->z[i] = position.z - s_recordOrigin.z - s_recordMissing.z * share;
+    }
+
     void RecordPlayerMoveEnd(Actor * player)
     {
         if(!s_enabled || !player) return;
+
+        if(s_recording)
+        {
+            _MESSAGE("NPC trail: the path of his body: %u samples over %u ms",
+                     (unsigned int)s_recording->count,
+                     (unsigned int)(s_recording->count ? s_recording->t[s_recording->count - 1] : 0));
+            s_recording = NULL;
+        }
 
         // First the landing, so that what is recorded is where he really ends up.
         NiPoint3 landing(0.0f, 0.0f, 0.0f);
@@ -2186,6 +2365,7 @@ namespace NpcParkour
         s_trailRun    = false;
         s_trailCall   = false;
         s_glide.active = false;
+        s_planPath    = NULL;
         s_anchorReset = true;                   // the tracked NPC, if any, is kept
         ResetCorrection();
     }
@@ -2203,5 +2383,7 @@ namespace NpcParkour
         s_callAfterTime = 0;
         s_playerMoveType = -1;
         s_glide.active = false;
+        s_recording = NULL;
+        for(int i = 0; i < kPathMax; ++i) s_paths[i].nodeTime = 0;
     }
 }
