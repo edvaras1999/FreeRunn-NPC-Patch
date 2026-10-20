@@ -1,24 +1,18 @@
-# FreeRun LE + parkour em NPC (passo 4, versão npc12: o caminho do teu corpo)
+# FreeRun LE + parkour em NPC (passo 4, versão npc13: várias seguidoras e resgate)
 
 Versão **de teste**, não para publicar. É o FreeRun LE 1.0.7 (código de 2 de outubro) com um módulo novo para NPCs. Tudo o que acontece fica no log (`Documentos\My Games\Skyrim\SKSE\FreerunLE.log`), nas linhas `NPC trail`, `NPC track` e `NPC landing`.
 
 > Aviso: não consegui compilar nem correr o jogo. A sintaxe do módulo novo foi verificada com os cabeçalhos do projeto. Se a compilação falhar, manda-me as linhas de erro do `build.log`.
 
-## O que mudou na npc12 (a partir do log da npc11)
-O que o log da npc11 mostrou:
-- **O rumo ficou resolvido:** em 23 repetições o erro de rumo foi de 0° a 6° (antes, 44° a 175°).
-- **19 de 23 repetições acabaram em cima** (de +96 a +198). As 4 más foram **a descer e de lado**: em "climb low" com a animação a correr, o corpo dela foi para baixo a um ritmo constante (cerca de 75 unidades por segundo, 100 unidades em 1,4 s) e 76 unidades para o lado, com o estado do controlador "no chão". Ela tinha começado o movimento numa encosta, e foi escorregando por ela: **a física dela estava a atuar, apesar de eu a ter desligado**. É a "luta com a IA" que notaste: o motor (a IA dela e a física) continua a mexer-lhe no corpo, e o que eu faço por cima é desfeito.
-- **Quando não responde:** 77 vezes. 46 por "algo sólido entre ela e o sítio" (a minha verificação do caminho varria um plano horizontal, que bate no chão a subir ao pé de qualquer encosta) e 31 por estar longe.
+## O que mudou na npc13 (a partir do log da npc12)
+O log da npc12: 20 movimentos repetidos, nenhum falhou, sem exceções. O problema está no que vem **depois**: a seguidora fica parada (velocidade 0,00) enquanto tu te afastas, uma vez durante **98 s e a 3500 unidades**. Isso não é a física nem o rumo: é a IA dela que deixou de lhe pedir para andar. A razão mais provável é a mais simples: **o topo de uma pedra não está na malha de navegação**, por isso não há caminho de lá até ti. Para além disso:
+- **Várias seguidoras:** agora podes seguir **até 3 NPCs** com F11 (carregar outra vez a olhar para um deles pára de o seguir). Só uma faz o movimento de cada vez: as outras esperam a sua vez (a resposta dura 10 s), por isso vão uma a seguir à outra.
+- **Resgate de uma seguidora parada:** se uma seguidora seguida está parada há 15 s, a mais de 450 unidades, com a velocidade a 0 (a IA não lhe pede para andar), é **posta de volta no teu rasto, um pouco atrás de ti**: um sítio onde tu já estiveste, portanto onde a IA já pode traçar um caminho. É o último recurso; `fStrandedSec=0` desliga-o.
+- **Movimentos interrompidos não são repetidos:** num movimento teu que parou ao fim de 375 ms (caiste ou cancelaste), ela repetia a animação toda, retida por um caminho de poucos ticks. Agora, abaixo de 900 ms (`iMinMoveMs`) o movimento é ignorado.
+- **Se alguma coisa der exceção** dentro do módulo, a seguidora que estava a ser movida recebe a física de volta (antes ficava com ela desligada).
 
-Por isso:
-1. **O corpo dela é levado ao longo do caminho que o teu corpo fez.** Durante cada movimento teu, o plugin grava, tick a tick, onde o teu corpo está, relativamente ao ponto de arranque, e tira a parte do "puxão" ao ponto (ela já começa no ponto). Quando ela repete o movimento, o plugin **escreve a posição dela em cada tick** ao longo desse caminho, com a animação dela a tocar. O motor deixa de ser quem a move, e não há nada com que a IA ou a física possam lutar. Isto vale para os movimentos que ela repete a partir do rasto (a resposta aos teus movimentos). Podes desligar com `bPathReplay=0`.
-2. O **NoSim é reafirmado a cada tick** enquanto ela está a ser levada.
-3. **A verificação do caminho** passou a seguir o chão: troços de até 120 unidades, cada um à altura da cintura **por cima do chão desse sítio**, e o chão onde se pode andar já não conta como obstáculo.
-
-## Como funciona (resumo)
-- **O rasto:** o plugin grava as tuas posições e, sempre que o FreeRun começa um movimento teu, o movimento (tipo, ponto de arranque, direção, caminho do corpo, onde acabaste).
-- **Seguidora seguida (F11):** quando fazes um movimento, a que está atrás de ti, a menos de 500 unidades e com o caminho livre, **vai ao mesmo sítio, a pé, e faz o mesmo**, levada ao longo do teu caminho. Se não acabar em cima, volta a tentar (até 3 vezes). O fim de cada escalada é um deslize suave para cima da superfície (`iLandingGlideMs`).
-- **Combate:** com a arma na mão, não começa; se sacar a arma a meio, pára.
+## O que mudou na npc12 (resumo)
+O corpo dela é levado ao longo do caminho que o teu corpo fez (grava-se tick a tick), com a física desligada reafirmada a cada tick, e a verificação do caminho segue o chão (`bPathReplay=1`).
 
 ## 1. Compilar
 1. Atualiza o repositório do GitHub com **tudo** o que está neste ZIP.
@@ -26,7 +20,7 @@ Por isso:
 3. Descarrega o artefacto `resultado`: tem o `FreerunLE.dll` e o `build.log`.
 
 ## 2. Instalar
-Substitui `Data\SKSE\Plugins\FreerunLE.dll` (guarda uma cópia). O log deve dizer `Freerun LE 1.0.7-npc12`.
+Substitui `Data\SKSE\Plugins\FreerunLE.dll` (guarda uma cópia). O log deve dizer `Freerun LE 1.0.7-npc13`.
 
 ## 3. Testar
 1. Olha para a seguidora com a câmara e carrega **F11**.
@@ -45,6 +39,9 @@ bLandingAssist=1      ; 0 desliga o assentamento no topo (nela e em ti)
 fLandingForward=38    ; quanto passa da aresta
 iLandingGlideMs=280   ; duração do deslize até lá (0 = instantâneo)
 bPathReplay=1         ; ela é levada ao longo do caminho que o teu corpo fez (0 = deixar ao motor)
+fStrandedSec=15       ; parada tanto tempo, longe de ti, a IA sem lhe pedir para andar: é posta no teu rasto (0 = nunca)
+fStrandedMinDistance=450
+iMinMoveMs=900        ; um movimento teu que parou antes disto foi interrompido e não é repetido
 bTrail=1
 bTrailWalk=0          ; 1 = também anda o rasto todo (experimental, deu problemas)
 fTrailMinHeight=120   ; gatilho antigo: tu tens de estar pelo menos isto acima dela

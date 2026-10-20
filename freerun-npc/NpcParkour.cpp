@@ -80,6 +80,9 @@ namespace
     float   s_landingForward    = 38.0f;    // ... this far past it
     int     s_landingGlideMs    = 280;      // ... getting there over this long (0: at once)
     bool    s_pathReplay        = true;     // she is carried along the path his body took, instead of left to the engine
+    float   s_strandedSec       = 15.0f;    // idle this long, far from the player: put back on his trail (0: never)
+    float   s_strandedMinDistance = 450.0f; // ... and at least this far from him
+    int     s_minMoveMs         = 900;      // a move of his that stopped sooner was interrupted, and is not repeated
     bool    s_manualToward      = true;     // F10: try the ledge between her and the player, from where she stands
     float   s_manualMaxGap      = 150.0f;   // F10: how far from the start mark she may be
 
@@ -113,6 +116,7 @@ namespace
     bool            s_trackRequested    = false;
     DWORD           s_trackRequestedAt  = 0;
     bool            s_manual            = true;     // the running move came from the key
+    int             s_active            = -1;       // the slot of the tracked NPC that runs the move (-1: none, or a manual test)
     bool            s_trailRun          = false;    // a trail replay is running
     bool            s_trailCall         = false;    // ... and it answers a move of the player's
     DWORD           s_callNodeTime      = 0;        // the move being answered (by its time)
@@ -396,6 +400,17 @@ namespace
             Graph::Notify(npc, Graph::GetNames().interrupt);
     }
 
+    void SafeReleaseNpc(Actor * npc)
+    {
+        __try
+        {
+            ReleaseNpc(npc, false);
+        }
+        __except(EXCEPTION_EXECUTE_HANDLER)
+        {
+        }
+    }
+
     // touchNpc is false when the NPC may no longer exist.
     void EndTest(bool touchNpc, bool sendInterrupt)
     {
@@ -616,6 +631,7 @@ namespace
         }
 
         s_manual = true;
+        s_active = -1;
         _MESSAGE("NPC test: key pressed");
 
         Actor * npc = FindTarget(player);
@@ -987,7 +1003,7 @@ namespace
             for(UInt32 i = 0; i < s_trailCount; ++i)
             {
                 const TrailNode & node = s_trail[i];
-                if(!node.isMove) continue;
+                if(!node.isMove || node.type == Parkour::kNoLedge) continue;
 
                 const float rise = (node.hasEnd ? node.end.z : node.pos.z + 80.0f) - pos.z;
                 if(rise < 40.0f) continue;                      // it would not lift her
@@ -1318,7 +1334,7 @@ namespace
         for(UInt32 i = 0; i < s_trailCount; ++i)
         {
             const TrailNode & node = s_trail[i];
-            if(!node.isMove) continue;
+            if(!node.isMove || node.type == Parkour::kNoLedge) continue;       // (kNoLedge: it was interrupted)
             if(node.time <= s_callAfterTime) continue;                          // answered
             if(now - node.time > (DWORD)(s_callWindowSec * 1000.0f)) continue;  // too long ago
             if(node.type == Parkour::kStepLow || node.type == Parkour::kStepHigh) continue;     // she steps up by herself
@@ -1776,6 +1792,140 @@ namespace
         return false;
     }
 
+    // ---- several tracked NPCs ------------------------------------------------
+    //
+    // Up to three NPCs can be tracked. What belongs to one NPC - where she was
+    // last, how long she has stood still, her history of distances, her pauses,
+    // which of the player's moves she has answered - lives in a slot, and the
+    // code that works on "the tracked NPC" keeps working on the globals above:
+    // the slot is copied in before her turn and back out after it. Only one of
+    // them runs a move at a time, and the others wait their turn: he made the
+    // move once, and they follow one after another.
+
+    enum { kMaxTracked = 3 };
+
+    struct Tracked
+    {
+        Actor *         tracked;
+        UInt32          trackedId;
+        NiPoint3        anchor;
+        DWORD           anchorTime;
+        bool            anchorReset;
+        DWORD           lastSample;
+        DWORD           lastProbe;
+        DWORD           lastTrackTrace;
+        DWORD           cooldownUntil;
+        Parkour::Type   lastProbeType;
+        bool            haveProbe;
+        Parkour::Type   probeToward;
+        float           probeTowardGap;
+        bool            haveProbeToward;
+        DWORD           histTime[kHistory];
+        float           histDist[kHistory];
+        UInt32          histCount;
+        UInt32          histNext;
+        DWORD           callAfterTime;
+        DWORD           lastCallCheck;
+        DWORD           lastCallWhyLog;
+        DWORD           lastTrailCheck;
+        DWORD           lastTrailWhyLog;
+    };
+
+    Tracked s_slots[kMaxTracked];
+
+    void LoadSlot(int i)
+    {
+        const Tracked & s = s_slots[i];
+        s_tracked = s.tracked;                  s_trackedId = s.trackedId;
+        s_anchor = s.anchor;                    s_anchorTime = s.anchorTime;        s_anchorReset = s.anchorReset;
+        s_lastSample = s.lastSample;            s_lastProbe = s.lastProbe;          s_lastTrackTrace = s.lastTrackTrace;
+        s_cooldownUntil = s.cooldownUntil;
+        s_lastProbeType = s.lastProbeType;      s_haveProbe = s.haveProbe;
+        s_probeToward = s.probeToward;          s_probeTowardGap = s.probeTowardGap;    s_haveProbeToward = s.haveProbeToward;
+        memcpy(s_histTime, s.histTime, sizeof(s_histTime));
+        memcpy(s_histDist, s.histDist, sizeof(s_histDist));
+        s_histCount = s.histCount;              s_histNext = s.histNext;
+        s_callAfterTime = s.callAfterTime;      s_lastCallCheck = s.lastCallCheck;  s_lastCallWhyLog = s.lastCallWhyLog;
+        s_lastTrailCheck = s.lastTrailCheck;    s_lastTrailWhyLog = s.lastTrailWhyLog;
+    }
+
+    void SaveSlot(int i)
+    {
+        Tracked & s = s_slots[i];
+        s.tracked = s_tracked;                  s.trackedId = s_trackedId;
+        s.anchor = s_anchor;                    s.anchorTime = s_anchorTime;        s.anchorReset = s_anchorReset;
+        s.lastSample = s_lastSample;            s.lastProbe = s_lastProbe;          s.lastTrackTrace = s_lastTrackTrace;
+        s.cooldownUntil = s_cooldownUntil;
+        s.lastProbeType = s_lastProbeType;      s.haveProbe = s_haveProbe;
+        s.probeToward = s_probeToward;          s.probeTowardGap = s_probeTowardGap;    s.haveProbeToward = s_haveProbeToward;
+        memcpy(s.histTime, s_histTime, sizeof(s_histTime));
+        memcpy(s.histDist, s_histDist, sizeof(s_histDist));
+        s.histCount = s_histCount;              s.histNext = s_histNext;
+        s.callAfterTime = s_callAfterTime;      s.lastCallCheck = s_lastCallCheck;  s.lastCallWhyLog = s_lastCallWhyLog;
+        s.lastTrailCheck = s_lastTrailCheck;    s.lastTrailWhyLog = s_lastTrailWhyLog;
+    }
+
+    int SlotOf(Actor * npc)
+    {
+        for(int i = 0; i < kMaxTracked; ++i)
+            if(s_slots[i].tracked == npc) return i;
+        return -1;
+    }
+
+    // ---- stranded ------------------------------------------------------------
+    //
+    // The last log had a follower standing on a rock for 98 seconds, her speed at
+    // 0.00 - her AI not asking her to move at all - while the player went 3,500
+    // units away. Nothing in what this module does explains an AI that has simply
+    // stopped, and the likeliest reason is the plainest: the top of a rock is not
+    // on the navigation mesh, so there is no path from where she stands to anyone.
+    // As a last resort, after she has stood idle for long enough and far enough
+    // from the player, she is put back on the player's own trail a little way
+    // behind him: a place he stood on, so a place the AI can path from.
+
+    bool FindRescueSpot(const NiPoint3 & playerPos, NiPoint3 & out)
+    {
+        for(UInt32 k = s_trailCount; k > 0; --k)
+        {
+            const TrailNode & node = s_trail[k - 1];
+            if(node.isMove) continue;
+
+            const float dx = node.pos.x - playerPos.x;
+            const float dy = node.pos.y - playerPos.y;
+            const float flat = sqrtf(dx * dx + dy * dy);
+            if(flat < 180.0f || flat > 450.0f) continue;
+            if(fabsf(node.pos.z - playerPos.z) > 150.0f) continue;
+
+            out = node.pos;
+            return true;
+        }
+        return false;
+    }
+
+    void RescueTeleport(Actor * npc, const NiPoint3 & spot, float stillFor, float distance)
+    {
+        void * ctrl = Engine::CharController(npc);
+        if(!ctrl) return;
+
+        const float scale = Engine::HavokScale();
+        __declspec(align(16)) float target[4];
+        target[0] = spot.x * scale;
+        target[1] = spot.y * scale;
+        target[2] = spot.z * scale;
+        target[3] = 0.0f;
+        Engine::ControllerSetPosition(ctrl, target, true, false);
+
+        __declspec(align(16)) float stopped[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        Engine::ControllerSetLinearVelocity(ctrl, stopped);
+        Engine::ControllerFlags(ctrl) &= ~Engine::Controller::kFlag_NoSim;
+
+        _MESSAGE("NPC track %08X: stranded: she has stood still for %.0f s, %.0f units from the player, her AI not asking "
+                 "her to move: put back on his trail, a little way behind him", (unsigned int)s_trackedId, stillFor, distance);
+
+        s_cooldownUntil = GetTickCount() + 20000;
+        s_anchorReset   = true;
+    }
+
     bool TrackedAlive(Actor * npc, UInt32 id)
     {
         __try
@@ -1811,28 +1961,61 @@ namespace
             return;
         }
 
-        if(npc == s_tracked)
+        const int existing = SlotOf(npc);
+        if(existing >= 0)
         {
-            StopTracking("asked to stop");
+            _MESSAGE("NPC track: stopped tracking %08X (asked to stop)", (unsigned int)s_slots[existing].trackedId);
+            s_slots[existing].tracked   = NULL;
+            s_slots[existing].trackedId = 0;
             ShowText("FreeRun NPC: no longer tracking this NPC.");
             return;
         }
 
-        s_tracked           = npc;
-        s_trackedId         = npc->formID;
-        s_anchorReset       = true;
-        s_cooldownUntil     = 0;
-        s_haveProbe         = false;
-        s_haveProbeToward   = false;
-        HistoryClear();
+        int slot = -1;
+        for(int i = 0; i < kMaxTracked; ++i)
+            if(!s_slots[i].tracked) { slot = i; break; }
 
-        _MESSAGE("NPC track: now tracking %08X (automatic moves %s)",
-                 (unsigned int)s_trackedId, s_autoTracked ? "on" : "off, log only");
+        if(slot < 0)
+        {
+            ShowText("FreeRun NPC: three NPCs are already tracked.\n\nPress the key facing one of them to stop tracking it first.");
+            return;
+        }
+
+        Tracked & s = s_slots[slot];
+        s.tracked           = npc;
+        s.trackedId         = npc->formID;
+        s.anchor            = Engine::Position(npc);
+        s.anchorTime        = GetTickCount();
+        s.anchorReset       = true;
+        s.lastSample        = 0;
+        s.lastProbe         = 0;
+        s.lastTrackTrace    = 0;
+        s.cooldownUntil     = 0;
+        s.lastProbeType     = Parkour::kNoLedge;
+        s.haveProbe         = false;
+        s.probeToward       = Parkour::kNoLedge;
+        s.probeTowardGap    = 0.0f;
+        s.haveProbeToward   = false;
+        s.histCount         = 0;
+        s.histNext          = 0;
+        s.callAfterTime     = GetTickCount();       // what he did before she was tracked is not hers to answer
+        s.lastCallCheck     = 0;
+        s.lastCallWhyLog    = 0;
+        s.lastTrailCheck    = 0;
+        s.lastTrailWhyLog   = 0;
+
+        int count = 0;
+        for(int i = 0; i < kMaxTracked; ++i)
+            if(s_slots[i].tracked) ++count;
+
+        _MESSAGE("NPC track: now tracking %08X (%d of %d; automatic moves %s)",
+                 (unsigned int)s.trackedId, count, (int)kMaxTracked, s_autoTracked ? "on" : "off, log only");
 
         char text[256];
         sprintf_s(text, sizeof(text),
-                  "FreeRun NPC: tracking this NPC.\n\n%s\n\nPress the same key facing it to stop.",
-                  s_autoTracked ? "When she runs round an obstacle she could climb, she will try to climb it."
+                  "FreeRun NPC: tracking this NPC (%d of %d).\n\n%s\n\nPress the same key facing it to stop.",
+                  count, (int)kMaxTracked,
+                  s_autoTracked ? "When you climb or vault something, she will go there and do it too."
                                 : "Log only: it will not move on its own.");
         ShowText(text);
     }
@@ -1909,6 +2092,19 @@ namespace
         // she needs the help.
         const bool canAct       = NpcCanAct(npc, why, true);
         const bool canLook      = canAct;
+
+        // ---- stranded: her AI is not asking her to move, and he is far -------
+        if(s_strandedSec > 0.0f && s_autoTracked && stillFor >= s_strandedSec && speed < 0.15f &&
+           distance >= s_strandedMinDistance && canAct && !Parkour::IsWeaponOut(npc) &&
+           now >= s_cooldownUntil && !Parkour::MenuOpen() && s_trailCount >= 3)
+        {
+            NiPoint3 spot(0.0f, 0.0f, 0.0f);
+            if(FindRescueSpot(playerPos, spot))
+            {
+                RescueTeleport(npc, spot, stillFor, distance);
+                return;
+            }
+        }
 
         // ---- the player's move: she answers it ------------------------------
         //
@@ -2117,12 +2313,26 @@ namespace
                 return;
             }
 
-            if(s_tracked)
+            for(int i = 0; i < kMaxTracked; ++i)
+            {
+                if(!s_slots[i].tracked) continue;
+
+                LoadSlot(i);
                 SafeTrackTick(player);
+                SaveSlot(i);
+
+                if(s_state != kIdle)            // she has started a move: the others wait
+                {
+                    s_active = i;
+                    break;
+                }
+            }
             return;
         }
 
+        if(s_active >= 0) LoadSlot(s_active);
         Step();
+        if(s_active >= 0) SaveSlot(s_active);
     }
 }
 
@@ -2168,6 +2378,13 @@ namespace NpcParkour
         s_landingForward    = ReadFloat("fLandingForward", s_landingForward);
         s_landingGlideMs    = GetPrivateProfileIntA(kSection, "iLandingGlideMs", s_landingGlideMs, kIni);
         s_pathReplay        = GetPrivateProfileIntA(kSection, "bPathReplay", s_pathReplay ? 1 : 0, kIni) != 0;
+        s_strandedSec       = ReadFloat("fStrandedSec", s_strandedSec);
+        s_strandedMinDistance = ReadFloat("fStrandedMinDistance", s_strandedMinDistance);
+        s_minMoveMs         = GetPrivateProfileIntA(kSection, "iMinMoveMs", s_minMoveMs, kIni);
+        if(s_strandedSec < 0.0f)        s_strandedSec = 0.0f;
+        if(s_strandedSec > 0.0f && s_strandedSec < 5.0f) s_strandedSec = 5.0f;
+        if(s_minMoveMs < 0)             s_minMoveMs = 0;
+        if(s_minMoveMs > 3000)          s_minMoveMs = 3000;
         if(s_landingGlideMs < 0)        s_landingGlideMs = 0;
         if(s_landingGlideMs > 800)      s_landingGlideMs = 800;
         if(s_callRadius < 100.0f)       s_callRadius = 100.0f;
@@ -2288,11 +2505,12 @@ namespace NpcParkour
     {
         if(!s_enabled || !player) return;
 
+        DWORD duration = 0;
         if(s_recording)
         {
+            duration = s_recording->count ? s_recording->t[s_recording->count - 1] : 0;
             _MESSAGE("NPC trail: the path of his body: %u samples over %u ms",
-                     (unsigned int)s_recording->count,
-                     (unsigned int)(s_recording->count ? s_recording->t[s_recording->count - 1] : 0));
+                     (unsigned int)s_recording->count, (unsigned int)duration);
             s_recording = NULL;
         }
 
@@ -2307,6 +2525,15 @@ namespace NpcParkour
 
         TrailNode & last = s_trail[s_trailCount - 1];
         if(!last.isMove || last.hasEnd) return;
+
+        // A move that stopped far too soon was interrupted - he fell, or cancelled
+        // it. She would play the whole animation for nothing, and be held still for
+        // all of it by a path a few ticks long.
+        if(last.path >= 0 && duration < (DWORD)s_minMoveMs)
+        {
+            _MESSAGE("NPC trail: that move stopped after %u ms: it was interrupted, so it is not repeated", (unsigned int)duration);
+            last.type = Parkour::kNoLedge;
+        }
 
         const NiPoint3 endPosition = landed ? landing : Engine::Position(player);
         last.end    = endPosition;
@@ -2341,6 +2568,16 @@ namespace NpcParkour
         __except(EXCEPTION_EXECUTE_HANDLER)
         {
             _ERROR("NPC: an exception inside the NPC module: its work is stopped here and the game goes on");
+
+            // Whoever was being moved gets her physics back, if she can still be reached.
+            if(s_state != kIdle && s_npc)
+                SafeReleaseNpc(s_npc);
+            for(int i = 0; i < kMaxTracked; ++i)
+            {
+                s_slots[i].tracked   = NULL;
+                s_slots[i].trackedId = 0;
+            }
+
             s_state             = kIdle;
             s_npc               = NULL;
             s_requested         = false;
@@ -2366,7 +2603,8 @@ namespace NpcParkour
         s_trailCall   = false;
         s_glide.active = false;
         s_planPath    = NULL;
-        s_anchorReset = true;                   // the tracked NPC, if any, is kept
+        s_anchorReset = true;                   // the tracked NPCs, if any, are kept
+        for(int i = 0; i < kMaxTracked; ++i) s_slots[i].anchorReset = true;
         ResetCorrection();
     }
 
@@ -2375,10 +2613,16 @@ namespace NpcParkour
     void Forget()
     {
         Reset();
-        if(s_tracked)
-            _MESSAGE("NPC track: %08X forgotten (a load or a new game)", (unsigned int)s_trackedId);
+        for(int i = 0; i < kMaxTracked; ++i)
+        {
+            if(s_slots[i].tracked)
+                _MESSAGE("NPC track: %08X forgotten (a load or a new game)", (unsigned int)s_slots[i].trackedId);
+            s_slots[i].tracked   = NULL;
+            s_slots[i].trackedId = 0;
+        }
         s_tracked   = NULL;
         s_trackedId = 0;
+        s_active    = -1;
         s_trailCount = 0;                       // the old world's trail means nothing in the new one
         s_callAfterTime = 0;
         s_playerMoveType = -1;
