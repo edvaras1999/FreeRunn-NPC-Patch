@@ -80,6 +80,7 @@ namespace
     float   s_landingForward    = 38.0f;    // ... this far past it
     int     s_landingGlideMs    = 280;      // ... getting there over this long (0: at once)
     bool    s_pathReplay        = true;     // she is carried along the path his body took, instead of left to the engine
+    bool    s_animDriven        = false;    // EXPERIMENT: tell the engine she is animation driven for the length of a move
     float   s_strandedSec       = 15.0f;    // idle this long, far from the player: put back on his trail (0: never)
     float   s_strandedMinDistance = 450.0f; // ... and at least this far from him
     int     s_minMoveMs         = 900;      // a move of his that stopped sooner was interrupted, and is not repeated
@@ -176,6 +177,18 @@ namespace
     NiPoint3    s_recordOrigin;                 // where his body was when the move was decided
     NiPoint3    s_recordMissing;                // the gap to the start mark, which the engine closes over 30 ticks
     MovePath *  s_planPath          = NULL;     // the path the running move is carried along
+
+    // One path for each kind of move, the latest of the player's. A move that is
+    // not one of his - an NPC deciding by herself that there is something to
+    // climb - has no path of its own to be carried along, and would be left to the
+    // engine, which is where the fighting was. It is given his path for that kind
+    // of move instead, turned to the heading she makes it with: the animation's
+    // movement is the same wherever it is made. (The type numbers run 0 to 8.)
+    enum { kTemplateTypes = 9 };
+    MovePath    s_templates[kTemplateTypes];
+    float       s_templateYaw[kTemplateTypes];
+    bool        s_haveTemplate[kTemplateTypes];
+    MovePath    s_tempPath;                     // the template turned to the heading of the move being made
     int             s_playerMoveType    = -1;       // the player's own last move, for his landing
     NiPoint3        s_playerMoveLedge;
     float           s_playerMoveYaw     = 0.0f;
@@ -396,6 +409,8 @@ namespace
         }
 
         Graph::SetInt(npc, Graph::GetNames().ledge, Parkour::kNoLedge);
+        if(s_animDriven)
+            Graph::SetBool(npc, Graph::GetNames().animationDriven, false);
         if(sendInterrupt)
             Graph::Notify(npc, Graph::GetNames().interrupt);
     }
@@ -593,6 +608,32 @@ namespace
         SetHeading(npc, ctrl, s_planYaw);
     }
 
+    // The template for this kind of move, turned to `yaw`: a displacement turned by
+    // the difference of the two headings (the heading runs clockwise from north,
+    // so a heading h points along (sin h, cos h)).
+    MovePath * BuildTemplatePath(int type, float yaw)
+    {
+        if(!s_pathReplay || type < 0 || type >= kTemplateTypes || !s_haveTemplate[type]) return NULL;
+
+        const MovePath & source = s_templates[type];
+        if(source.count < 4) return NULL;
+
+        const float d = yaw - s_templateYaw[type];
+        const float c = cosf(d);
+        const float s = sinf(d);
+
+        s_tempPath.nodeTime = 0;
+        s_tempPath.count    = source.count;
+        for(UInt32 i = 0; i < source.count; ++i)
+        {
+            s_tempPath.t[i] = source.t[i];
+            s_tempPath.x[i] = source.x[i] * c + source.y[i] * s;
+            s_tempPath.y[i] = -source.x[i] * s + source.y[i] * c;
+            s_tempPath.z[i] = source.z[i];
+        }
+        return &s_tempPath;
+    }
+
     // Starts a move on an NPC whose ledge is already known. When `turn` is set she
     // is turned to `yaw` (the way the engine reads it: clockwise from north).
     // Her physics are switched off at once, so that she cannot run on while the
@@ -615,6 +656,11 @@ namespace
 
         s_planYaw = turn ? yaw : Engine::Rotation(npc).z;
         SetHeading(npc, ctrl, s_planYaw);
+
+        s_planPath = BuildTemplatePath((int)type, s_planYaw);
+        if(s_planPath)
+            _MESSAGE("NPC test: carried along a template path for a %s (%u samples, %u ms)",
+                     TypeName(type), (unsigned int)s_planPath->count, (unsigned int)s_planPath->t[s_planPath->count - 1]);
 
         s_walkInit   = false;
         s_stateStart = GetTickCount();
@@ -790,6 +836,16 @@ namespace
         ResetCorrection();
 
         Graph::SetInt(npc, n.ledge, type);
+
+        // The experiment: the engine is told that her movement is the animation's
+        // for as long as the move lasts, which is what it already does for scripted
+        // and synced animations. If it holds, the engine's own movement for her is
+        // set aside by the engine itself, and nothing has to be fought.
+        if(s_animDriven)
+        {
+            Graph::SetBool(npc, n.animationDriven, true);
+            _MESSAGE("NPC test: bAnimationDriven set for the length of the move");
+        }
 
         if(type == Parkour::kStepHigh || type == Parkour::kStepLow)
             Graph::SetBool(npc, n.lowerBody, Parkour::IsWeaponOut(npc));
@@ -1515,6 +1571,13 @@ namespace
                 s_planPath = &s_paths[node.path];
                 _MESSAGE("NPC trail: carried along the path his body took (%u samples, %u ms)",
                          (unsigned int)s_planPath->count, (unsigned int)s_planPath->t[s_planPath->count - 1]);
+            }
+            else
+            {
+                s_planPath = BuildTemplatePath((int)node.type, node.yaw);
+                if(s_planPath)
+                    _MESSAGE("NPC trail: no path of his own for that one: carried along the template for a %s",
+                             TypeName(node.type));
             }
             s_walkInit      = false;
             s_state         = kAligning;
@@ -2378,6 +2441,7 @@ namespace NpcParkour
         s_landingForward    = ReadFloat("fLandingForward", s_landingForward);
         s_landingGlideMs    = GetPrivateProfileIntA(kSection, "iLandingGlideMs", s_landingGlideMs, kIni);
         s_pathReplay        = GetPrivateProfileIntA(kSection, "bPathReplay", s_pathReplay ? 1 : 0, kIni) != 0;
+        s_animDriven        = GetPrivateProfileIntA(kSection, "bAnimDriven", s_animDriven ? 1 : 0, kIni) != 0;
         s_strandedSec       = ReadFloat("fStrandedSec", s_strandedSec);
         s_strandedMinDistance = ReadFloat("fStrandedMinDistance", s_strandedMinDistance);
         s_minMoveMs         = GetPrivateProfileIntA(kSection, "iMinMoveMs", s_minMoveMs, kIni);
@@ -2506,6 +2570,8 @@ namespace NpcParkour
         if(!s_enabled || !player) return;
 
         DWORD duration = 0;
+        MovePath * recorded = s_recording;
+        const int movedType = s_playerMoveType;
         if(s_recording)
         {
             duration = s_recording->count ? s_recording->t[s_recording->count - 1] : 0;
@@ -2538,6 +2604,18 @@ namespace NpcParkour
         const NiPoint3 endPosition = landed ? landing : Engine::Position(player);
         last.end    = endPosition;
         last.hasEnd = true;
+
+        // A complete move of his is the template for that kind of move.
+        if(last.type != Parkour::kNoLedge && recorded && movedType >= 0 && movedType < (int)kTemplateTypes &&
+           duration >= (DWORD)s_minMoveMs && recorded->count >= 4)
+        {
+            s_templates[movedType]      = *recorded;
+            s_templates[movedType].nodeTime = 0;
+            s_templateYaw[movedType]    = s_playerMoveYaw;
+            s_haveTemplate[movedType]   = true;
+            _MESSAGE("NPC trail: kept as the template for a %s (%u samples, %u ms)",
+                     TypeName((Parkour::Type)movedType), (unsigned int)recorded->count, (unsigned int)duration);
+        }
 
         // The walk carries on from where the move ended.
         TrailAppend(MakeWalkNode(endPosition, GetTickCount()));
