@@ -2633,6 +2633,39 @@ namespace NpcParkour
     // Once per animation update of the player. The common case - nothing
     // requested, nothing running, nothing tracked - is a handful of comparisons.
     //
+    // ---- FreeClimb: tells FreeClimbLE.dll who the tracked followers are (one per slot) ----
+    // The follower chosen with F11 can then climb walls beside the player, repeating the player's moves.
+    // Nothing happens if FreeClimbLE.dll is not installed. Only the pointer and the form id travel;
+    // FreeClimbLE.dll checks them on every use.
+    typedef void (*FreeClimbSetFollower_t)(int slot, void * actor, UInt32 formId);
+
+    void PublishToFreeClimb()
+    {
+        static bool                     looked = false;
+        static FreeClimbSetFollower_t   setFollower = NULL;
+        if(!looked)
+        {
+            looked = true;
+            HMODULE module = GetModuleHandleA("FreeClimbLE.dll");
+            if(module)
+                setFollower = (FreeClimbSetFollower_t)GetProcAddress(module, "FreeClimb_SetFollower");
+        }
+        if(!setFollower)
+            return;
+
+        static Actor *  lastActor[kMaxTracked];
+        static UInt32   lastId[kMaxTracked];
+        for(int i = 0; i < kMaxTracked; ++i)
+        {
+            if(s_slots[i].tracked == lastActor[i] && s_slots[i].trackedId == lastId[i])
+                continue;
+
+            lastActor[i] = s_slots[i].tracked;
+            lastId[i]    = s_slots[i].trackedId;
+            setFollower(i, s_slots[i].tracked, s_slots[i].trackedId);
+        }
+    }
+
     // The whole module runs inside an exception guard. This code is called from
     // an AI worker thread, while other threads change the very actors it looks
     // at, so a pointer that was good a moment ago can stop being good. Whatever
@@ -2642,6 +2675,7 @@ namespace NpcParkour
         __try
         {
             TickInner(player);
+            PublishToFreeClimb();
         }
         __except(EXCEPTION_EXECUTE_HANDLER)
         {
@@ -2663,6 +2697,7 @@ namespace NpcParkour
             s_tracked           = NULL;
             s_trackedId         = 0;
             ResetCorrection();
+            PublishToFreeClimb();
         }
     }
 
